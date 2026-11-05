@@ -63,6 +63,21 @@ event, run and operator boundaries, displays ordered events with expandable
 facts, and includes both windows in the full copy. Unattributed reports remain
 unattributed. Missing follow-ups, capacity limits and incomplete collection are
 visible rather than presented as complete evidence.
+
+Saturn Android can attach a phone screenshot after the user enables the optional
+setting. Screenshots may contain information visible on the phone; they are not
+part of the redacted technical fields. The separate private R2 binding
+`DIAGNOSTIC_MEDIA` uses bucket `saturnws-diagnostic-media`, with the `screenshots/`
+prefix expiring after seven days. Keep public access disabled. Only
+`diagnostics:read` administrators can retrieve images. Uploads require the
+per-report capture capability and exact image digest, accept JPEG only, and are
+limited to 1 MiB and six requests per minute per client IP. The app retains at
+most ten encrypted pending images, retries them for up to 24 hours, and purges
+expired material when running. Disabling sharing purges pending local media.
+The technical report remains usable if image capture or delivery fails. The
+optional metadata requires no database schema migration. Worker and Pages must
+be promoted before distributing an Android build with the setting.
+
 Summary collection stops after 45 seconds; full collection stops
 after 120 seconds. Cancellation and deadlines abort the underlying requests.
 If clipboard access is blocked, selectable text and a file download remain

@@ -27,11 +27,16 @@ const diagnosticPrivacy = {
   ar: 'تسجّل Saturn Workspace الأعطال الفنية تلقائيًا من بدء التشغيل حتى الإغلاق للمساعدة في تشخيص المشكلات. قد تشمل التقارير رسائل الخطأ والتتبّع الفني، وإصدارات الأداة ونظام التشغيل، ومراحل التشغيل، وعدد مرات الفشل، وسياق الطلب بعد إزالة البيانات الحساسة. لا يُنسب التقرير لمستخدم Saturn إلا من خلال جلسة موثوقة؛ وتبقى تقارير بدء التشغيل التي لا تملك جلسة موثوقة غير منسوبة. لا تُرسل كلمات المرور أو مفاتيح المصادقة أو رموز الوصول أو محتوى الرسائل أو الملاحظات. يطّلع على التقارير المسؤولون المخوّلون فقط، وتُحفظ لمدة 90 يومًا ثم تُحذف تلقائيًا. تُعاد محاولة إرسال التقارير المحفوظة دون اتصال عند توفر الاتصال. قد يمنع الإغلاق المفاجئ تسجيل خطأ لم يُحفظ بعد.',
 } as const
 
+const androidScreenshotPrivacy = {
+  en: 'In Saturn Android, you can choose to attach the phone screen to error reports. This is off by default. After you enable it, a screenshot of the phone involved in the failed operation is captured and sent automatically, with a notice in the app. It may include information visible on that phone. The computer screen is not captured. Screenshots are available only to authorized support administrators through private storage, with automatic deletion after 7 days. Pending screenshots are encrypted on your computer for up to 24 hours. You can turn this off at any time; pending local screenshots are then deleted. Technical reports still work without screenshots.',
+  ar: 'في Saturn Android، يمكنك اختيار إرفاق شاشة الهاتف مع تقارير الأخطاء. الخيار مغلق افتراضيًا. بعد تفعيله، تُلتقط شاشة الهاتف المرتبط بالعملية التي فشلت وتُرسل تلقائيًا، مع إشعار داخل الأداة. قد تتضمن اللقطة معلومات ظاهرة على الهاتف. لا تُلتقط شاشة الكمبيوتر. تُحفظ الصور في تخزين خاص لا يتيحها إلا لمسؤولي الدعم المخوّلين، وتُحذف تلقائيًا بعد 7 أيام. تُحفظ اللقطات المعلّقة مشفّرة على الكمبيوتر لمدة لا تتجاوز 24 ساعة. يمكنك إيقاف الإرفاق في أي وقت؛ عندها تُحذف اللقطات المحلية المعلّقة. تستمر التقارير التقنية بدون صور.',
+} as const
+
 export function legalPageContent(page: string, locale: 'ar' | 'en', fallbackBody: string) {
   const titles = legalTitles[locale]
   const title = titles[page as keyof typeof titles] || titles.privacy
   return {
     title,
-    body: page === 'terms' ? oneDeviceTerms[locale] : page === 'privacy' ? `${fallbackBody}\n\n${diagnosticPrivacy[locale]}` : fallbackBody,
+    body: page === 'terms' ? oneDeviceTerms[locale] : page === 'privacy' ? `${fallbackBody}\n\n${diagnosticPrivacy[locale]}\n\n${androidScreenshotPrivacy[locale]}` : fallbackBody,
   }
 }

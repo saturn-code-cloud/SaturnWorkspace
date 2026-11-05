@@ -342,6 +342,7 @@ export type AdminAdapter = {
   sendAdminTestEmail(input: { recipient: string; emailType?: string; locale?: 'ar' | 'en'; subject?: string; message?: string }): Promise<void>
   listCrashLogs(filters?: AdminDiagnosticFilters, signal?: AbortSignal): Promise<AdminDiagnosticPage>
   getCrashLog(id: string, signal?: AbortSignal): Promise<AdminCrashLog>
+  getDiagnosticScreenshot(id: string, signal?: AbortSignal): Promise<Blob>
   listCrashGroups(filters?: AdminDiagnosticFilters): Promise<AdminDiagnosticPage<AdminCrashGroup>>
   updateCrashGroupState(fingerprint: string, input: { status: AdminCrashGroup['status']; assignee?: string; note?: string }): Promise<AdminCrashGroup>
   listTamperAlerts(input?: { page?: number; limit?: number; resolved?: boolean; severity?: string }): Promise<AdminTamperAlert[]>

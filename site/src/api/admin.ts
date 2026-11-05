@@ -328,6 +328,7 @@ export type AdminCrashLog = {
   first_happened_at?: string | null
   last_happened_at?: string | null
   technical_context?: Record<string, unknown>
+  screenshot?: { status: 'available' | 'pending' | 'expired' | 'unavailable'; captured_at?: string; expires_at?: string } | null
   raw_payload?: {
     auth?: {
       source?: string | null
@@ -755,6 +756,19 @@ async function adminFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (payload === undefined && raw) throw new ApiError(compactAdminError(raw, response.status, path), response.status)
   return payload as T
+}
+
+export async function fetchDiagnosticScreenshot(id: string, signal?: AbortSignal): Promise<Blob> {
+  const headers = new Headers()
+  const token = getAdminToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${adminBaseUrl()}/crash-logs/${encodeURIComponent(id)}/screenshot`, {
+    headers, credentials: 'same-origin', cache: 'no-store', signal,
+  })
+  if (!response.ok || response.headers.get('Content-Type') !== 'image/jpeg') {
+    throw new ApiError(`diagnostic_image_unavailable_${response.status}`, response.status)
+  }
+  return response.blob()
 }
 
 export async function fetchAdminPreauthState() {

@@ -20,6 +20,10 @@ crons = ["17 3 * * *"]
 binding = "OTA_BUCKET"
 bucket_name = "saturnws-ota"
 
+[[r2_buckets]]
+binding = "DIAGNOSTIC_MEDIA"
+bucket_name = "saturnws-diagnostic-media"
+
 [[services]]
 binding = "POLICY_WORKER"
 service = "saturnws-policy"
@@ -50,6 +54,13 @@ name = "ADMIN_RATE_LIMIT_CRASH_INGEST"
 namespace_id = "41014"
   [ratelimits.simple]
   limit = 120
+  period = 60
+
+[[ratelimits]]
+name = "ADMIN_RATE_LIMIT_DIAGNOSTIC_MEDIA"
+namespace_id = "41015"
+  [ratelimits.simple]
+  limit = 6
   period = 60
 
 [vars]

@@ -25,6 +25,7 @@ import {
   fetchAuditLog,
   fetchCrashGroups,
   fetchCrashLog,
+  fetchDiagnosticScreenshot,
   fetchCrashLogs,
   fetchEmailOperations as fetchAdminEmailOperations,
   fetchPromoCodes,
@@ -957,6 +958,9 @@ export const productionAdapters: AppAdapters = {
     },
     async getCrashLog(id, signal) {
       return (await fetchCrashLog(id, signal)).item
+    },
+    getDiagnosticScreenshot(id, signal) {
+      return fetchDiagnosticScreenshot(id, signal)
     },
     listCrashGroups(filters = {}) {
       return fetchCrashGroups(filters)
