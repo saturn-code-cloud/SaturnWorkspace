@@ -93,6 +93,8 @@
 .ui-table { width: 100%; border-collapse: collapse; min-width: 720px; font-size: var(--text-body-sm); }
 .ui-table th { height: 40px; padding: 0 var(--space-4); background: var(--background-subtle); color: var(--text-secondary); font-size: var(--text-caption); font-weight: 600; text-align: start; white-space: nowrap; }
 .ui-table td { height: 52px; padding: 0 var(--space-4); border-top: 1px solid var(--border-soft); vertical-align: middle; }
+.ui-table .ui-table__selection { width: 44px; padding-inline: var(--space-3); text-align: center; }
+.ui-table__selection input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .ui-table tr.is-clickable { cursor: pointer; }.ui-table tbody tr:hover { background: var(--surface-hover); }
 .ui-table-toolbar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); flex-wrap: wrap; }
 .ui-table-toolbar .ui-search { width: min(320px, 100%); }.ui-table-toolbar__spacer { flex: 1; }

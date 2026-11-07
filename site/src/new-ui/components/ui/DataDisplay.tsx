@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useEffect, useRef, type MouseEvent, type ReactNode } from 'react'
 import { ChevronLeft, ChevronRight, MoreHorizontal, Search } from 'lucide-react'
 import { IconButton } from './Button'
 import { EmptyState, Skeleton } from './Feedback'
@@ -26,15 +26,42 @@ export function Breadcrumbs({ items, label }: { items: { label: string; onClick?
 
 export type Column<T> = { key: string; header: string; width?: string; render: (row: T) => ReactNode }
 
-export function DataTable<T>({ columns, rows, rowKey, emptyTitle, emptyBody, loading = false, onRowClick }: { columns: Column<T>[]; rows: T[]; rowKey: (row: T) => string; emptyTitle: string; emptyBody: string; loading?: boolean; onRowClick?: (row: T) => void }) {
+type TableSelection<T> = {
+  selectedKeys: ReadonlySet<string>
+  onChange: (keys: Set<string>) => void
+  rowLabel: (row: T) => string
+  selectAllLabel: string
+}
+
+function SelectionCheckbox({ checked, indeterminate = false, label, onChange, onClick }: { checked: boolean; indeterminate?: boolean; label: string; onChange: () => void; onClick?: (event: MouseEvent<HTMLInputElement>) => void }) {
+  const input = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (input.current) input.current.indeterminate = indeterminate
+  }, [indeterminate])
+  return <input ref={input} type="checkbox" checked={checked} aria-label={label} onChange={onChange} onClick={onClick} />
+}
+
+export function DataTable<T>({ columns, rows, rowKey, emptyTitle, emptyBody, loading = false, onRowClick, selection }: { columns: Column<T>[]; rows: T[]; rowKey: (row: T) => string; emptyTitle: string; emptyBody: string; loading?: boolean; onRowClick?: (row: T) => void; selection?: TableSelection<T> }) {
   if (!loading && rows.length === 0) return <EmptyState title={emptyTitle} body={emptyBody} />
+  const pageKeys = rows.map(rowKey)
+  const selectedOnPage = pageKeys.filter((key) => selection?.selectedKeys.has(key)).length
+  const allOnPageSelected = pageKeys.length > 0 && selectedOnPage === pageKeys.length
+  const changePageSelection = () => {
+    if (!selection) return
+    const next = new Set(selection.selectedKeys)
+    for (const key of pageKeys) {
+      if (allOnPageSelected) next.delete(key)
+      else next.add(key)
+    }
+    selection.onChange(next)
+  }
   return (
     <div className="ui-table-wrap">
       <table className="ui-table">
-        <thead><tr>{columns.map((column) => <th key={column.key} style={{ width: column.width }}>{column.header}</th>)}</tr></thead>
+        <thead><tr>{selection ? <th className="ui-table__selection"><SelectionCheckbox checked={allOnPageSelected} indeterminate={selectedOnPage > 0 && !allOnPageSelected} label={selection.selectAllLabel} onChange={changePageSelection} /></th> : null}{columns.map((column) => <th key={column.key} style={{ width: column.width }}>{column.header}</th>)}</tr></thead>
         <tbody>
-          {loading ? Array.from({ length: 5 }, (_, index) => <tr key={index}>{columns.map((column) => <td key={column.key}><Skeleton width={column.width ? '80%' : '65%'} /></td>)}</tr>) : rows.map((row) => (
-            <tr key={rowKey(row)} className={onRowClick ? 'is-clickable' : ''} onClick={() => onRowClick?.(row)}>{columns.map((column) => <td key={column.key}>{column.render(row)}</td>)}</tr>
+          {loading ? Array.from({ length: 5 }, (_, index) => <tr key={index}>{selection ? <td className="ui-table__selection"><Skeleton width="1rem" /></td> : null}{columns.map((column) => <td key={column.key}><Skeleton width={column.width ? '80%' : '65%'} /></td>)}</tr>) : rows.map((row) => (
+            <tr key={rowKey(row)} className={onRowClick ? 'is-clickable' : ''} onClick={() => onRowClick?.(row)}>{selection ? <td className="ui-table__selection"><SelectionCheckbox checked={selection.selectedKeys.has(rowKey(row))} label={selection.rowLabel(row)} onClick={(event) => event.stopPropagation()} onChange={() => { const next = new Set(selection.selectedKeys); const key = rowKey(row); if (next.has(key)) next.delete(key); else next.add(key); selection.onChange(next) }} /></td> : null}{columns.map((column) => <td key={column.key}>{column.render(row)}</td>)}</tr>
           ))}
         </tbody>
       </table>

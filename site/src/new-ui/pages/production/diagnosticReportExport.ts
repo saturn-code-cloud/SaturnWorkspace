@@ -46,6 +46,29 @@ export function collectDiagnosticReports(
   return withDeadline(signal, options.deadlineMs ?? 120000, (active) => collectAllReports(reader, filters, active, onProgress))
 }
 
+export function collectDiagnosticReportsByIds(
+  reader: Pick<DiagnosticReader, 'getCrashLog'>,
+  ids: readonly string[],
+  signal: AbortSignal,
+  options: { deadlineMs?: number } = {},
+): Promise<AdminCrashLog[]> {
+  const uniqueIds = [...new Set(ids.filter(Boolean))]
+  return withDeadline(signal, options.deadlineMs ?? 45000, async (active) => {
+    const reports: AdminCrashLog[] = []
+    for (let start = 0; start < uniqueIds.length; start += DIAGNOSTIC_BUNDLE_LIMITS.concurrency) {
+      checkActive(active)
+      const batch = await Promise.all(uniqueIds.slice(start, start + DIAGNOSTIC_BUNDLE_LIMITS.concurrency).map(async (id) => {
+        const detail = await reader.getCrashLog(id, active)
+        if (detail.id !== id) throw new Error('diagnostic_export_mismatch')
+        return detail
+      }))
+      checkActive(active)
+      reports.push(...batch)
+    }
+    return reports
+  })
+}
+
 async function collectAllReports(reader: DiagnosticReader, filters: AdminDiagnosticFilters, signal: AbortSignal, onProgress: DiagnosticProgress): Promise<AdminCrashLog[]> {
   const reports: AdminCrashLog[] = []
   const ids = new Set<string>()
