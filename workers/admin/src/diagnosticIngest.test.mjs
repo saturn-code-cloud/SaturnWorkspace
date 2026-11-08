@@ -141,7 +141,7 @@ test("report detail includes before and linked after evidence without losing red
   assert.notEqual(root.item.id, rootEventId);
   assert.notEqual(child.item.id, childEventId);
   assert.equal(root.classification, "error");
-  assert.equal(child.classification, "warning");
+  assert.equal(child.classification, "supplement");
   const result = await getCrashLog(root.item.id, env);
   assert.equal(result.item.technical_context.trace.events[0].event, "api.begin");
   assert.equal(result.item.technical_context.trace_followup.events[0].facts.actor, "saturn");
@@ -427,6 +427,21 @@ test("diagnostic pages preserve microseconds and the ID tie-break without skippi
     { at: rows[3].happened_at, id: rows[3].id },
   ]);
   assert.equal(cursor, null);
+});
+
+test("trace supplements stay linked to the parent report but never appear as separate problems", async (context) => {
+  const happenedAt = new Date(Date.now() - 10000).toISOString();
+  const runId = "2ecda24e-2b8f-4381-9d16-15aefde2d32a";
+  const parentEventId = "00000000-0000-4000-8000-000000000071";
+  const rows = [
+    diagnosticRow(71, happenedAt, { raw_payload: { component: "desktop-app", event_id: parentEventId, trace: { format: "saturnws.technical-trace.v1", run_id: runId } } }),
+    diagnosticRow(72, happenedAt, { error_type: "DiagnosticTraceFollowup", raw_payload: { component: "diagnostics", trace: { format: "saturnws.technical-trace.v1", run_id: runId, parent_event_id: parentEventId } } }),
+  ];
+  context.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(rows), { status: 200 }));
+
+  const result = await listCrashLogs(new URL("https://admin.example.test/api/admin/crash-logs?classification=all"), diagnosticEnv());
+
+  assert.deepEqual(result.items.map((row) => row.id), [rows[0].id]);
 });
 
 test("group states are fetched by page fingerprints even beyond the first thousand states", async (context) => {

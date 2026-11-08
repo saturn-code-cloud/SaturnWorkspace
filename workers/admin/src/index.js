@@ -3677,7 +3677,7 @@ export async function listCrashLogs(url, env) {
       const row = data[index];
       lastScanned = row;
       const rowClassification = classifyDiagnostic(row);
-      if (rowClassification !== "expected" && (classification === "all" || rowClassification === classification)) selected.push(row);
+      if (!["expected", "supplement"].includes(rowClassification) && (classification === "all" || rowClassification === classification)) selected.push(row);
       if (selected.length === limit) {
         hasMore = hasMore || index < data.length - 1;
         break;

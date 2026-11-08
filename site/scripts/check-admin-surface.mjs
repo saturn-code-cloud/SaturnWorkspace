@@ -43,7 +43,7 @@ console.log('PASS Diagnostic event timeline: ordered events, complete bounded wi
 const exportSource = read('src/new-ui/pages/production/diagnosticReportExport.ts')
 const exportModule = { exports: {} }
 new Function('exports', ts.transpileModule(exportSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText)(exportModule.exports)
-const { collectDiagnosticReports, createDiagnosticBundle, formatDiagnosticReports, DIAGNOSTIC_BUNDLE_LIMITS } = exportModule.exports
+const { collectDiagnosticReports, collectDiagnosticReportsByIds, createDiagnosticBundle, formatDiagnosticReports, DIAGNOSTIC_BUNDLE_LIMITS } = exportModule.exports
 const fullReport = (id) => ({ id, happened_at: '2026-10-11T12:00:00Z', error_type: 'synthetic_failure', message: 'Synthetic report', stack_trace: 'full trace\n'.repeat(1000), technical_context: { lifecycle: { phase: 'ready' } }, raw_payload: { secret: 'not-for-export' } })
 const requested = []
 let concurrent = 0
@@ -77,6 +77,16 @@ await assert.rejects(collectDiagnosticReports(reader, {}, cancelled.signal, () =
 const duringRead = new AbortController()
 await assert.rejects(collectDiagnosticReports({ ...reader, getCrashLog: async (id) => { duringRead.abort(); return fullReport(id) } }, {}, duringRead.signal, () => assert.fail('Cancelled work must not publish progress')), { name: 'AbortError' })
 console.log('PASS Full diagnostic collection: pagination, detail, bounded concurrency, filters, cancellation, failures and safe export')
+concurrent = 0
+peak = 0
+const selected = await collectDiagnosticReportsByIds(reader, ['4', '2', '4', '1'], new AbortController().signal)
+assert.deepEqual(selected.map((report) => report.id), ['4', '2', '1'])
+assert.equal(peak, 3)
+await assert.rejects(collectDiagnosticReportsByIds({ getCrashLog: async () => fullReport('wrong') }, ['1'], new AbortController().signal), /mismatch/)
+const cancelledSelection = new AbortController()
+cancelledSelection.abort()
+await assert.rejects(collectDiagnosticReportsByIds(reader, ['1'], cancelledSelection.signal), { name: 'AbortError' })
+console.log('PASS Selected diagnostic collection: stable order, de-duplication, bounded concurrency, cancellation and identity checks')
 const record = (id, signature = 'repeated', version = '1.2.10') => ({ ...fullReport(String(id)), fingerprint: signature, app_version: version, component: 'desktop-app', occurrence_count: 3, stack_trace: '', classification: 'error' })
 const records = Array.from({ length: 2400 }, (_, index) => record(index, `signature-${index % 3}`))
 const boundedCalls = []
@@ -250,7 +260,9 @@ const checks = [
   ['User detail includes support and access requests', userDetail.includes('support_threads') && userDetail.includes('login_requests')],
   ['Crash group state is operational', diagnostics.includes('updateCrashGroupState') && diagnostics.includes('CrashGroupStateDialog')],
   ['Diagnostics uses manual refresh only', !diagnostics.includes('10000')],
-  ['Diagnostics copies full detail across every matching page', diagnostics.includes('collectDiagnosticReports(admin, filters') && diagnostics.includes('formatDiagnosticReports([details.data!]')],
+  ['Diagnostics copies full detail across every matching page', diagnostics.includes('collectDiagnosticReports(admin, filters') && diagnostics.includes('formatDiagnosticReports([details.data], {})')],
+  ['Diagnostics copies one loaded report directly without a second dialog', diagnostics.includes('navigator.clipboard.writeText(formatDiagnosticReports([details.data], {}))') && !section('function DiagnosticReportDialog', 'function CrashGroupStateDialog').includes('<DiagnosticCopyControl')],
+  ['Diagnostics supports selecting and copying multiple full reports', diagnostics.includes('collectDiagnosticReportsByIds(admin, [...selectedIds]') && diagnostics.includes('selection={{ selectedKeys: selectedIds') && diagnostics.includes('Copy selected (')],
   ['Diagnostics defaults to a bounded problem summary', diagnostics.includes('createDiagnosticBundle(admin, filters') && diagnostics.includes('Copy problem summary') && diagnostics.includes('Copy all matching reports (slower)')],
   ['Diagnostic reads forward cancellation into HTTP', api.includes('params: AdminDiagnosticFilters = {}, signal?: AbortSignal') && api.includes('encodeURIComponent(id)}`, { signal })') && adapters.includes('fetchCrashLogs(filters, signal)') && adapters.includes('fetchCrashLog(id, signal)')],
   ['Tamper resolution requires an explicit note', diagnostics.includes('TamperResolveDialog') && diagnostics.includes('reason.trim().length < 3')],

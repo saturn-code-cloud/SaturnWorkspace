@@ -28,3 +28,13 @@ test("unknown provider and runtime failures remain actionable", () => {
   assert.equal(classifyDiagnostic({ error_type: "FrontendStartupTimeout", message: "Frontend did not become ready" }), "error");
   assert.equal(classifyDiagnostic({ error_type: "OSError", message: "[Errno 22] Invalid argument" }), "error");
 });
+
+test("valid trace follow-ups are internal supplements while malformed ones remain visible", () => {
+  const trace = {
+    format: "saturnws.technical-trace.v1",
+    run_id: "2ecda24e-2b8f-4381-9d16-15aefde2d32a",
+    parent_event_id: "00000000-0000-4000-8000-000000000001",
+  };
+  assert.equal(classifyDiagnostic({ error_type: "DiagnosticTraceFollowup", raw_payload: { trace } }), "supplement");
+  assert.equal(classifyDiagnostic({ error_type: "DiagnosticTraceFollowup", raw_payload: { trace: { ...trace, parent_event_id: "invalid" } } }), "error");
+});

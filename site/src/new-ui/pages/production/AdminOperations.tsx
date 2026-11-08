@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type DependencyList,
 } from "react";
@@ -9,6 +10,7 @@ import {
   Activity,
   Bug,
   CheckCircle2,
+  Copy,
   RefreshCcw,
   ShieldAlert,
   Users,
@@ -60,7 +62,7 @@ import {
 import { Tabs } from "../../components/ui/Navigation";
 import { Drawer, Modal } from "../../components/ui/Overlays";
 import { DiagnosticCopyControl } from "./DiagnosticCopyControl";
-import { collectDiagnosticReports, createDiagnosticBundle, formatDiagnosticReports } from "./diagnosticReportExport";
+import { collectDiagnosticReports, collectDiagnosticReportsByIds, createDiagnosticBundle, formatDiagnosticReports } from "./diagnosticReportExport";
 
 type Resource<T> = {
   data: T | null;
@@ -2672,7 +2674,7 @@ export function AdminDiagnostics() {
         />
         </>
       ) : (
-        <DiagnosticReportHistory key={`${tab}:${filters.user || ""}:${filters.search || ""}:${filters.attribution || ""}`} filters={{ ...filters, classification: tab === "warnings" ? "warning" : "all" }} />
+        <DiagnosticReportHistory key={`${tab}:${filters.user || ""}:${filters.search || ""}:${filters.attribution || ""}:${filters.component || ""}`} filters={{ ...filters, classification: tab === "warnings" ? "warning" : "all" }} />
       )}
       <CrashGroupStateDialog
         key={selectedGroup?.fingerprint || "crash-group:closed"}
@@ -2701,6 +2703,11 @@ function DiagnosticReportHistory({ filters }: { filters: AdminDiagnosticFilters 
   const { admin } = useAdapters();
   const [cursors, setCursors] = useState([""]);
   const [selected, setSelected] = useState<AdminCrashLog | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [copyingSelected, setCopyingSelected] = useState(false);
+  const [copySelectedStatus, setCopySelectedStatus] = useState<"" | "success" | "error">("");
+  const copySelectedAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => copySelectedAbort.current?.abort(), []);
   const reports = useResource(
     () => admin.listCrashLogs({ ...filters, cursor: cursors.at(-1) }),
     [admin, filters.user, filters.search, filters.classification, filters.attribution, cursors],
@@ -2715,14 +2722,34 @@ function DiagnosticReportHistory({ filters }: { filters: AdminDiagnosticFilters 
     { key: "date", header: copy(locale, "Last seen", "آخر ظهور"), render: (row) => date(row.last_happened_at || row.happened_at, locale) },
     { key: "action", header: copy(locale, "Report", "التقرير"), render: (row) => <Button size="sm" onClick={() => setSelected(row)}>{copy(locale, "View", "عرض")}</Button> },
   ];
+  const copySelectedReports = async () => {
+    if (!selectedIds.size || copyingSelected) return;
+    setCopyingSelected(true);
+    setCopySelectedStatus("");
+    const controller = new AbortController();
+    copySelectedAbort.current = controller;
+    try {
+      const reports = await collectDiagnosticReportsByIds(admin, [...selectedIds], controller.signal);
+      await navigator.clipboard.writeText(formatDiagnosticReports(reports, filters));
+      setCopySelectedStatus("success");
+    } catch {
+      if (!controller.signal.aborted) setCopySelectedStatus("error");
+    } finally {
+      if (copySelectedAbort.current === controller) copySelectedAbort.current = null;
+      if (!controller.signal.aborted) setCopyingSelected(false);
+    }
+  };
   return <div className="stack">
     <div className="cluster">
       <Button disabled={reports.loading} onClick={() => { if (cursors.length > 1) setCursors([""]); else reports.reload(); }}>{copy(locale, "Refresh latest reports", "تحديث أحدث التقارير")}</Button>
       <DiagnosticCopyControl bundle label={copy(locale, "Copy problem summary", "نسخ ملخص المشاكل")} prepare={(signal, progress) => createDiagnosticBundle(admin, filters, signal, progress)} />
       <DiagnosticCopyControl label={copy(locale, "Copy all matching reports (slower)", "نسخ كل التقارير المطابقة (أبطأ)")} prepare={async (signal, progress) => formatDiagnosticReports(await collectDiagnosticReports(admin, filters, signal, progress), filters)} />
+      <Button disabled={!selectedIds.size} loading={copyingSelected} leadingIcon={<Copy size={16} />} onClick={copySelectedReports}>{copy(locale, `Copy selected (${selectedIds.size})`, `نسخ المحدد (${selectedIds.size})`)}</Button>
     </div>
+    {copySelectedStatus === "success" ? <Alert tone="success" title={copy(locale, "Selected reports copied", "تم نسخ التقارير المحددة")} /> : null}
+    {copySelectedStatus === "error" ? <Alert tone="danger" title={copy(locale, "Selected reports could not be copied", "تعذر نسخ التقارير المحددة")} /> : null}
     <p className="secondary">{copy(locale, "The problem summary groups up to 1,000 recent matching records and includes up to 40 full examples within 512 KiB. It states its coverage and omissions. Copy all matching reports collects every page and may take longer. Passwords, tokens, message contents and notes are excluded.", "ملخص المشاكل يجمع حتى 1,000 سجل حديث مطابق حسب المشكلة، ويضم حتى 40 مثالًا كاملًا في حدود 512 KiB، مع توضيح نطاقه وما لم يُدرج فيه. نسخ كل التقارير المطابقة يجمع كل الصفحات وقد يستغرق وقتًا أطول. كلمات المرور والتوكنات ومحتوى الرسائل والملاحظات مستبعدة.")}</p>
-    {reports.error ? <Alert tone="danger" title={copy(locale, "Reports could not be loaded", "تعذر تحميل التقارير")}><Button onClick={reports.reload}>{copy(locale, "Retry", "إعادة المحاولة")}</Button></Alert> : <DataTable columns={columns} rows={reports.data?.items || []} loading={reports.loading} rowKey={(row) => row.id} emptyTitle={copy(locale, "No matching reports", "لا توجد تقارير مطابقة")} emptyBody={copy(locale, "Reports are retained for 90 days. Continue to older pages when available.", "نحتفظ بالتقارير لمدة 90 يومًا. انتقل للصفحات الأقدم إن كانت متاحة.")} />}
+    {reports.error ? <Alert tone="danger" title={copy(locale, "Reports could not be loaded", "تعذر تحميل التقارير")}><Button onClick={reports.reload}>{copy(locale, "Retry", "إعادة المحاولة")}</Button></Alert> : <DataTable columns={columns} rows={reports.data?.items || []} loading={reports.loading} rowKey={(row) => row.id} selection={{ selectedKeys: selectedIds, onChange: setSelectedIds, rowLabel: (row) => copy(locale, `Select ${row.error_type}`, `تحديد ${row.error_type}`), selectAllLabel: copy(locale, "Select all reports on this page", "تحديد كل تقارير هذه الصفحة") }} emptyTitle={copy(locale, "No matching reports", "لا توجد تقارير مطابقة")} emptyBody={copy(locale, "Reports are retained for 90 days. Continue to older pages when available.", "نحتفظ بالتقارير لمدة 90 يومًا. انتقل للصفحات الأقدم إن كانت متاحة.")} />}
     <Pagination page={cursors.length} pages={cursors.length + (reports.data?.has_more ? 1 : 0)} label={copy(locale, "Report page", "صفحة التقارير")} previousLabel={copy(locale, "Newer", "الأحدث")} nextLabel={copy(locale, "Older", "الأقدم")} onChange={(page) => { if (page < cursors.length) setCursors((items) => items.slice(0, -1)); else if (reports.data?.next_cursor) setCursors((items) => [...items, reports.data!.next_cursor!]); }} />
     <DiagnosticReportDialog key={selected?.id || "diagnostic-report:closed"} report={selected} onClose={() => setSelected(null)} />
   </div>;
@@ -2777,6 +2804,7 @@ function DiagnosticReportDialog({
 }) {
   const { locale } = useExperience();
   const { admin } = useAdapters();
+  const [copyStatus, setCopyStatus] = useState<"" | "success" | "error">("");
   const details = useResource(() => summary ? admin.getCrashLog(summary.id) : Promise.resolve(null), [admin, summary?.id]);
   const report = details.data || summary;
   const technicalFields = diagnosticTechnicalFields({
@@ -2789,6 +2817,16 @@ function DiagnosticReportDialog({
     },
     ...Object.fromEntries(Object.entries(report?.technical_context || {}).filter(([key]) => !key.startsWith("trace"))),
   });
+  const copyFullReport = async () => {
+    if (!details.data) return;
+    setCopyStatus("");
+    try {
+      await navigator.clipboard.writeText(formatDiagnosticReports([details.data], {}));
+      setCopyStatus("success");
+    } catch {
+      setCopyStatus("error");
+    }
+  };
   return (
     <Modal
       open={Boolean(report)}
@@ -2797,7 +2835,7 @@ function DiagnosticReportDialog({
       closeLabel={copy(locale, "Close", "إغلاق")}
       footer={
         <>
-        <DiagnosticCopyControl label={copy(locale, "Copy full report", "نسخ التقرير كاملًا")} disabled={details.loading || !details.data} prepare={async () => formatDiagnosticReports([details.data!], {})} />
+        <Button leadingIcon={<Copy size={16} />} disabled={details.loading || !details.data} onClick={copyFullReport}>{copyStatus === "success" ? copy(locale, "Copied", "تم النسخ") : copy(locale, "Copy full report", "نسخ التقرير كاملًا")}</Button>
         <Button disabled={details.loading} onClick={details.reload}>{copy(locale, "Refresh report", "تحديث التقرير")}</Button>
         <Button onClick={onClose}>
           {copy(locale, "Close", "إغلاق")}
@@ -2807,6 +2845,7 @@ function DiagnosticReportDialog({
     >
       {report ? (
         <div className="stack">
+          {copyStatus === "error" ? <Alert tone="danger" title={copy(locale, "The report could not be copied", "تعذر نسخ التقرير")} /> : null}
           {details.error ? <Alert tone="danger" title={copy(locale, "The full report could not be loaded", "تعذر تحميل التقرير الكامل")}><Button onClick={details.reload}>{copy(locale, "Retry", "إعادة المحاولة")}</Button></Alert> : null}
           <div>
             <h3>{report.error_type}</h3>

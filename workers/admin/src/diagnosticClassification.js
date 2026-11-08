@@ -10,13 +10,22 @@ const EXPECTED_MESSAGES = new Set([
 ]);
 
 const WARNING_ERROR_TYPES = new Set([
-  "diagnostictracefollowup",
   "googledriveautosyncfailed",
   "googledriveinitialsyncfailed",
   "updatemanifesterror",
   "updatemanifestfetcherror",
   "timeouterror",
 ]);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isTraceSupplement(row, errorType) {
+  if (errorType !== "diagnostictracefollowup") return false;
+  const trace = row?.raw_payload?.trace;
+  return trace?.format === "saturnws.technical-trace.v1"
+    && UUID_RE.test(String(trace.run_id || ""))
+    && UUID_RE.test(String(trace.parent_event_id || ""));
+}
 
 const NETWORK_WARNING_TOKENS = [
   "winerror 10051",
@@ -38,6 +47,7 @@ export function classifyDiagnostic(row) {
   const combined = `${message} ${stack}`;
 
   if (EXPECTED_MESSAGES.has(message)) return "expected";
+  if (isTraceSupplement(row, errorType)) return "supplement";
   const context = String(row?.raw_payload?.context || "").toLowerCase();
   if (context === "app.main" || context === "extension-agent.main" || errorType.startsWith("launcher_") || errorType === "frontendstartuptimeout" || message === "startup_preload_missing") return "error";
   if (String(row?.raw_payload?.severity || "").toLowerCase() === "warning" || errorType === "previousrununclosed") return "warning";
