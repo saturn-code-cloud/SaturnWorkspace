@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 const TOOL_PATH = 'tools/check-authority-surface.mjs'
 const TEST_PATH = 'tools/authority-surface.test.mjs'
 export const PRODUCT_DECISION_REGISTER_URL =
-  'https://github.com/xSATAAAN/SaturnWorkspace-Desktop/blob/main/README.md#approved-product-decision-register'
+  'https://github.com/saturn-code-cloud/SaturnWorkspace-Desktop/blob/main/README.md#approved-product-decision-register'
 const PRODUCT_DECISION_REGISTER_HEADING = '## Approved product decision register'
 const ACTIVE_AUTHORITY = new Map([
   ['AGENTS.md', 16_384],

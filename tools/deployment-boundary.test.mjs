@@ -68,7 +68,7 @@ test("Pages provenance hashes the complete payload without hashing itself", asyn
   const evidence = await buildPagesProvenance({
     distRoot: root,
     sourceSha: SOURCE_SHA,
-    repository: "xSATAAAN/SaturnWorkspace",
+    repository: "saturn-code-cloud/SaturnWorkspace",
     workflowRunId: "123",
     workflowRunAttempt: "1",
     builtAt: new Date("2026-07-30T00:00:00Z"),
