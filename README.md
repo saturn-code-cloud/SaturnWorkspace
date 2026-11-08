@@ -3,7 +3,7 @@
 - Status: canonical source guide
 - Scope: public/customer/admin Web surfaces and Auth, Admin, Policy, and Route Check Workers
 - Owner: repository maintainer
-- Last verified: 2026-10-13
+- Last verified: 2026-11-08
 - Verification: protected `web-required` CI
 
 Canonical Web and control-plane source for Saturn Workspace. The project is
@@ -37,8 +37,8 @@ attempt observations are short-lived and excluded from persistent application
 analytics. Infrastructure providers may still create transport-level logs
 outside Saturn's application retention controls.
 
-The Desktop source is the separate protected repository
-`xSATAAAN/SaturnWorkspace-Desktop`. `contracts/desktop-control-plane.v1.json`
+The Desktop source is the separate private canonical repository
+`saturn-code-cloud/SaturnWorkspace-Desktop`. `contracts/desktop-control-plane.v1.json`
 is the Web producer contract; Desktop pins its reviewed content and producer
 commit.
 

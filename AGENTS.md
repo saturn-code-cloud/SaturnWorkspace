@@ -3,7 +3,7 @@
 - Status: active repository instructions
 - Scope: `D:\SaturnWS\github-deploy\SaturnWorkspace`
 - Owner: repository maintainer
-- Last verified: 2026-08-23
+- Last verified: 2026-11-08
 - Verification: protected `web-required` CI and `tools/check-authority-surface.mjs`
 
 When this repository is used inside the full `D:\SaturnWS` workspace, the
@@ -16,8 +16,8 @@ sibling checkout exists.
 - This protected Git repository is the canonical source for the public site,
   customer and administrator UI, shared Web contracts, and Auth, Admin, Policy,
   and Route Check Workers.
-- Desktop is the separate protected repository
-  `xSATAAAN/SaturnWorkspace-Desktop`.
+- Desktop is the separate private canonical repository
+  `saturn-code-cloud/SaturnWorkspace-Desktop`.
   The producer contract is `contracts/desktop-control-plane.v1.json`; Desktop
   pins an exact reviewed copy and producer commit.
 - Other workspace trees, generated Pages output, Wrangler state, screenshots,
@@ -47,7 +47,7 @@ not establish current roadmap, product, or engineering authority.
 
 The single cumulative owner-approved product decision register is the
 `Approved product decision register` section at
-https://github.com/xSATAAAN/SaturnWorkspace-Desktop/blob/main/README.md#approved-product-decision-register.
+https://github.com/saturn-code-cloud/SaturnWorkspace-Desktop/blob/main/README.md#approved-product-decision-register.
 An authenticated product-design or review context must read it before changing
 cross-repository product intent or capability boundaries. If that private
 register is unavailable, stop that work explicitly; do not infer intent from
