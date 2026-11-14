@@ -8,6 +8,7 @@ import {
   releaseTargetAudienceKey,
 } from "./releaseContract.js";
 import { classifyDiagnostic, isActionableCrash } from "./diagnosticClassification.js";
+import { diagnosticScreenshotInfo, enforceDiagnosticMediaRateLimit, uploadDiagnosticScreenshot, readDiagnosticScreenshot } from "./diagnosticMedia.js";
 import {
   adminContext,
   adminRoleAssignmentsState,
@@ -596,6 +597,12 @@ export default {
         await requireAdminContext(request, env, "diagnostics:read");
         return json(await getCrashLog(decodeURIComponent(crashLogMatch[1]), env), 200, corsHeaders(request, env));
       }
+      const diagnosticImageRead = url.pathname.match(/^\/api\/admin\/crash-logs\/([a-f0-9-]+)\/screenshot$/);
+      if (diagnosticImageRead && request.method === "GET") {
+        await requireAdminContext(request, env, "diagnostics:read");
+        const row = await loadDiagnosticMediaRow(diagnosticImageRead[1], env);
+        return await readDiagnosticScreenshot(env, row, corsHeaders(request, env));
+      }
       if (url.pathname === "/api/admin/crash-groups" && request.method === "GET") {
         await requireAdminContext(request, env, "diagnostics:read");
         return json(await listCrashGroups(url, env), 200, corsHeaders(request, env));
@@ -625,6 +632,15 @@ export default {
       }
       if (url.pathname === "/api/crash-logs/ingest" && request.method === "POST") {
         return json(await ingestCrashLog(request, env), 200, corsHeaders(request, env));
+      }
+      const diagnosticImageWrite = url.pathname.match(/^\/api\/crash-logs\/([a-f0-9-]+)\/screenshot$/);
+      if (diagnosticImageWrite && request.method === "POST") {
+        if (!isUuid(diagnosticImageWrite[1])) throw new Error("invalid_diagnostic_id");
+        await enforceDiagnosticMediaRateLimit(request, env);
+        const id = await diagnosticStorageId(diagnosticImageWrite[1]);
+        const row = await loadDiagnosticMediaRow(id, env);
+        if (row.raw_payload?.event_id !== diagnosticImageWrite[1]) throw new Error("diagnostic_media_forbidden");
+        return json(await uploadDiagnosticScreenshot(request, env, row), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/licenses/issue" && request.method === "POST") {
         return json({ success: false, error: "account_subscription_required" }, 410, corsHeaders(request, env));
@@ -671,8 +687,8 @@ export default {
         "session_expired",
         "session_revoked",
       ]);
-      const forbiddenErrors = new Set(["download_not_entitled", "forbidden_origin", "origin_not_allowed", "admin_permission_denied"]);
-      const notFoundErrors = new Set(["release_not_found", "release_artifact_missing", "order_not_found", "account_not_found", "subscription_not_found", "session_not_found", "device_not_found", "pending_grant_not_found", "device_change_request_not_found", "diagnostic_not_found"]);
+      const forbiddenErrors = new Set(["download_not_entitled", "forbidden_origin", "origin_not_allowed", "admin_permission_denied", "diagnostic_media_forbidden"]);
+      const notFoundErrors = new Set(["release_not_found", "release_artifact_missing", "order_not_found", "account_not_found", "subscription_not_found", "session_not_found", "device_not_found", "pending_grant_not_found", "device_change_request_not_found", "diagnostic_not_found", "diagnostic_image_not_found", "diagnostic_image_expired"]);
       const conflictErrors = new Set(["pending_grant_already_exists", "pending_grant_not_pending", "device_change_request_not_pending", "device_change_request_changed", "preview_changed", "same_version_already_active", "release_version_not_newer", "subscription_integrity_conflict", "historical_subscription_cannot_be_reactivated", "stale_subscription_state", "operation_previously_failed"]);
       const status = authErrors.has(message) || message.startsWith("admin_email_not_allowed")
         ? 401
@@ -684,7 +700,7 @@ export default {
               ? 409
             : message === "rate_limited"
               ? 429
-              : message === "rate_limit_unavailable"
+              : message === "rate_limit_unavailable" || message === "diagnostic_media_unavailable"
                 ? 503
                 : message === "diagnostic_payload_too_large"
                   ? 413
@@ -3700,6 +3716,7 @@ export async function getCrashLog(id, env) {
   const rows = await safeSupabaseRead(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&id=eq.${id}&happened_at=gte.${encodeURIComponent(diagnosticCutoff())}&limit=1`);
   if (!rows.length) throw new Error("diagnostic_not_found");
   const item = (await projectDiagnosticRows(rows, env, { detail: true }))[0];
+  item.screenshot = await diagnosticScreenshotInfo(rows[0], env);
   const trace = item.technical_context.trace;
   if (trace && isUuid(trace.followup_event_id)) {
     if (!isUuid(trace.run_id) || !isUuid(item.event_id)) {
@@ -3725,6 +3742,13 @@ export async function getCrashLog(id, env) {
     item.technical_context.trace_followup_status = trace?.followup_status || "not_recorded";
   }
   return { success: true, item };
+}
+
+async function loadDiagnosticMediaRow(id, env) {
+  if (!isUuid(id)) throw new Error("invalid_diagnostic_id");
+  const rows = await safeSupabaseRead(env, "crash_logs", `select=id,happened_at,raw_payload&id=eq.${id}&limit=1`);
+  if (!rows.length) throw new Error("diagnostic_not_found");
+  return rows[0];
 }
 
 export function diagnosticTrace(value) {

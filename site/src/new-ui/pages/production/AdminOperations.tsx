@@ -2795,6 +2795,34 @@ function DiagnosticEventWindow({ value, title }: { value: unknown; title: string
   </details>;
 }
 
+function DiagnosticPhoneScreenshot({ report }: { report: AdminCrashLog }) {
+  const { locale } = useExperience();
+  const { admin } = useAdapters();
+  const [image, setImage] = useState("");
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (report.screenshot?.status !== "available") return;
+    const controller = new AbortController();
+    let objectUrl = "";
+    admin.getDiagnosticScreenshot(report.id, controller.signal).then((blob) => {
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      setImage(objectUrl);
+    }).catch(() => { if (!controller.signal.aborted) setFailed(true); });
+    return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [admin, report.id, report.screenshot?.status]);
+  if (!report.screenshot) return null;
+  return <section className="stack diagnostic-phone-screenshot">
+    <strong>{copy(locale, "Phone screen at the error", "شاشة الهاتف وقت الخطأ")}</strong>
+    {report.screenshot.status === "expired" ? <p>{copy(locale, "The screenshot expired after 7 days.", "انتهت مدة الاحتفاظ باللقطة بعد 7 أيام.")}</p>
+      : report.screenshot.status === "pending" ? <p>{copy(locale, "The screenshot has not arrived yet. Refresh the report later.", "لم تصل اللقطة بعد. حدّث التقرير لاحقًا.")}</p>
+      : failed || report.screenshot.status === "unavailable" ? <p>{copy(locale, "The screenshot could not be loaded. Close and reopen the report to retry.", "تعذر تحميل اللقطة. أغلق التقرير وافتحه لإعادة المحاولة.")}</p>
+      : image ? <img src={image} alt={copy(locale, "Phone screenshot attached with the user's consent", "لقطة شاشة الهاتف المرفقة بموافقة المستخدم")} style={{ maxWidth: "100%", maxHeight: "65vh", objectFit: "contain", alignSelf: "center" }} />
+      : <p role="status">{copy(locale, "Loading screenshot…", "جار تحميل اللقطة…")}</p>}
+    {report.screenshot.expires_at ? <small>{copy(locale, "Available until", "متاحة حتى")} {date(report.screenshot.expires_at, locale)}</small> : null}
+  </section>;
+}
+
 function DiagnosticReportDialog({
   report: summary,
   onClose,
@@ -2868,6 +2896,7 @@ function DiagnosticReportDialog({
             <strong>{copy(locale, "Technical trace", "التتبع الفني")}</strong>
             <pre className="diagnostic-report-trace" dir="ltr">{details.loading ? copy(locale, "Loading technical trace…", "جارٍ تحميل التتبّع الفني…") : report.stack_trace || "—"}</pre>
           </div>
+          <DiagnosticPhoneScreenshot key={report.id} report={report} />
           <details className="diagnostic-technical-details">
             <summary>{copy(locale, "Events around the failure", "الأحداث المحيطة بالخطأ")}</summary>
             <dl className="detail-list" dir="ltr"><div><dt>followup_status</dt><dd>{String(report.technical_context?.trace_followup_status || "—")}</dd></div></dl>
