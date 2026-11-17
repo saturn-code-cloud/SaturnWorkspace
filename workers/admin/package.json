@@ -6,14 +6,20 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check:syntax": "node --check src/index.js && node --check src/diagnosticClassification.js && node --check src/routes/payments.js && node --check src/routes/downloads.js && node --check src/routes/adminOperations.js && node --check src/services/orders.js && node --check src/services/supabase.js && node --check src/security/firebaseCustomer.js && node --check src/security/payments.js && node --check src/validation/payments.js",
+    "check:syntax": "node --check src/index.js && node --check src/diagnosticClassification.js && node --check src/routes/payments.js && node --check src/routes/downloads.js && node --check src/routes/adminOperations.js && node --check src/services/orders.js && node --check src/services/supabase.js && node --check src/services/adminAuditDelivery.js && node --check src/security/firebaseCustomer.js && node --check src/security/payments.js && node --check src/validation/payments.js",
     "test:diagnostics": "node --test src/diagnosticClassification.test.mjs src/diagnosticIngest.test.mjs",
     "test:commerce": "node --test src/services/orders.test.mjs src/routes/downloads.test.mjs ../shared/subscriptions/resolver.test.mjs",
     "test:manual-grant": "node scripts/check-manual-grant.mjs",
-    "test:admin-operations": "node --test src/routes/adminOperations.test.mjs src/adminCors.test.mjs src/adminRecords.test.mjs",
+    "test:admin-operations": "node --test src/routes/adminOperations.test.mjs src/adminCors.test.mjs src/adminRecords.test.mjs src/services/adminAuditDelivery.test.mjs",
     "test:schema-contract": "node scripts/check-schema-contract.mjs",
     "test:release-contract": "node --test src/releaseContract.test.mjs",
     "test:required": "npm run test:schema-contract && npm run test:commerce && npm run test:manual-grant && npm run test:admin-operations && npm run test:release-contract && npm run test:diagnostics"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5",
+      "undici": "7.30.1"
+    }
   },
   "devDependencies": {
     "wrangler": "^4.16.1"

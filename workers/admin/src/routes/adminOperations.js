@@ -77,8 +77,12 @@ export function adminContext(env, identityOrEmail) {
   return { email: normalizedEmail, firebase_uid: firebaseUid || null, role, permissions: [...permissions] }
 }
 
+export function hasPermission(context, permission) {
+  return context?.permissions.includes("*") || context?.permissions.includes(permission) || false
+}
+
 export function requirePermission(context, permission) {
-  if (!context || (!context.permissions.includes("*") && !context.permissions.includes(permission))) {
+  if (!hasPermission(context, permission)) {
     throw new Error("admin_permission_denied")
   }
   return context

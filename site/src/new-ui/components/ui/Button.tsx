@@ -1,10 +1,10 @@
-import type { ButtonHTMLAttributes, ReactNode } from 'react'
+import type { ComponentPropsWithRef, ReactNode } from 'react'
 import { LoaderCircle } from 'lucide-react'
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'text'
 type ButtonSize = 'sm' | 'md' | 'lg'
 
-export type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+export type ButtonProps = ComponentPropsWithRef<'button'> & {
   variant?: ButtonVariant
   size?: ButtonSize
   loading?: boolean

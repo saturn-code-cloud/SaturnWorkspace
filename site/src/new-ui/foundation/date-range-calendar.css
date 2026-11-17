@@ -1,0 +1,33 @@
+.date-range-calendar.rdp-root {
+  --rdp-accent-color: var(--action-primary);
+  --rdp-accent-background-color: var(--surface-active);
+  --rdp-day-height: clamp(30px, 9vw, 38px);
+  --rdp-day-width: var(--rdp-day-height);
+  --rdp-day_button-height: var(--rdp-day-height);
+  --rdp-day_button-width: var(--rdp-day-width);
+  --rdp-day_button-border-radius: var(--radius-sm);
+  --rdp-range_start-color: var(--action-primary-text);
+  --rdp-range_end-color: var(--action-primary-text);
+  --rdp-today-color: var(--brand-primary);
+  --rdp-disabled-opacity: 0.45;
+  justify-self: center;
+  margin-inline: auto;
+  inline-size: max-content;
+  max-inline-size: 100%;
+  color: var(--text-primary);
+  font-size: var(--text-body-sm);
+}
+
+.date-range-calendar .rdp-caption_label { font-size: var(--text-body); font-weight: 650; }
+.date-range-calendar .rdp-weekday { color: var(--text-secondary); font-size: var(--text-caption); opacity: 1; }
+.date-range-calendar .rdp-day_button { font-size: var(--text-body); }
+.date-range-calendar .rdp-chevron { fill: currentColor; }
+.date-range-calendar .rdp-button_previous,
+.date-range-calendar .rdp-button_next { border-radius: var(--radius-sm); color: var(--text-primary); }
+.date-range-calendar .rdp-button_previous:hover:not([aria-disabled="true"]),
+.date-range-calendar .rdp-button_next:hover:not([aria-disabled="true"]),
+.date-range-calendar .rdp-day:not(.rdp-selected) .rdp-day_button:hover:not(:disabled) { background: var(--surface-hover); }
+.date-range-calendar .rdp-day_button:focus-visible,
+.date-range-calendar .rdp-button_previous:focus-visible,
+.date-range-calendar .rdp-button_next:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.date-range-calendar .rdp-selected { font-size: inherit; }

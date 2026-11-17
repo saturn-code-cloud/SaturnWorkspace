@@ -1,31 +1,65 @@
 import type {
+  AdminAuditFilters,
   AdminAuditLogItem,
+  AdminAuditPage,
   AdminCrashGroup,
   AdminCrashLog,
   AdminDiagnosticFilters,
   AdminDiagnosticPage,
+  AdminDiagnosticTriage,
+  AdminDiagnosticCoverage,
+  AdminDiagnosticCoveragePeriod,
   AdminDeviceChangePreview,
+  AdminDeviceChangeFilter,
+  AdminDeviceChangePage,
   AdminDeviceChangeRequest,
   AdminDeviceResetPreview,
   AdminPromoCode,
+  AdminPromoDirectoryQuery,
+  AdminPromoDirectoryPage,
   AdminReleaseManifest,
+  AdminReviewedReleaseArtifacts,
+  AdminStagedReleaseArtifact,
+  AdminStagedReleaseArtifacts,
   AdminRemoteControls,
   AdminSubscription,
   AdminSupportMessage,
   AdminSupportAuditEvent,
+  AdminSupportInboxPage,
+  AdminSupportInboxQuery,
   AdminSupportThread,
   AdminUserDetail,
-  AdminEmailStatus,
-  AdminCommerceOverview,
-  AdminUserSummary,
+  AdminEmailConfiguration,
+  AdminEmailActivityQuery,
+  AdminEmailActivityPage,
+  AdminEmailJobDetail,
+  AdminEmailProcessingResult,
+  AdminEmailQueueResult,
+  AdminCommercePage,
+  AdminCommerceQuery,
+  AdminCommerceConfiguration,
+  AdminOrderRecordsView,
+  AdminOrderDetail,
+  AdminUserDirectoryItem,
+  AdminUserDirectoryQuery,
   AdminSession,
   AdminOperationReason,
   AdminOperationPreview,
   AdminReadiness,
   AdminTamperAlert,
+  AdminTamperAlertFilters,
+  AdminTamperAlertPage,
   AdminInviteCode,
-  AdminInviteUsage,
-  AdminPolicyState,
+  AdminInviteDirectoryQuery,
+  AdminInviteDirectoryPage,
+  AdminInviteDetail,
+  AdminPolicyDirectory,
+  AdminPolicyDirectoryQuery,
+  AdminPolicyVersionState,
+  AdminPolicyVersionChange,
+  AdminPolicyPlanDetail,
+  AdminGlobalPolicy,
+  AdminGlobalPolicyChange,
   ManualGrantExecuteInput,
   ManualGrantPreview,
   ManualGrantPreviewInput,
@@ -117,9 +151,10 @@ export type PlanInfo = {
 }
 
 export type AdminDashboardState = {
-  kpis?: Record<string, number | null>
-  recentActivity?: Array<{ id?: string; timestamp?: string; actor?: string | null; action?: string; target_type?: string | null; target_id?: string | null; outcome?: string; request_id?: string | null }>
-  degradedResources?: string[]
+  kpis: Record<'total_users' | 'total_active_users' | 'active_sessions' | 'active_tampering_alerts', number | null>
+  recentActivity: (Pick<AdminAuditLogItem, 'action' | 'timestamp' | 'actor' | 'request_id'> & { id: string })[]
+  degradedResources: string[]
+  subscriptionCountLimited: boolean
 }
 
 export type PaymentIntentInput = {
@@ -202,7 +237,7 @@ export type AuthAdapter = {
   signInWithEmail(email: string, password: string): Promise<AppUser>
   startEmailRegistration(input: SignUpWithEmailInput): Promise<EmailRegistrationStartResult>
   finalizeEmailRegistration(input: { email: string; password: string; registrationId: string; finalizationToken: string }): Promise<AppUser>
-  signInWithGoogle(input?: { locale?: 'ar' | 'en'; termsAccepted?: boolean; termsVersion?: string; provisionProfile?: boolean }): Promise<AppUser>
+  signInWithGoogle(input?: { locale?: 'ar' | 'en'; termsAccepted?: boolean; termsVersion?: string; provisionProfile?: boolean; selectAccount?: boolean }): Promise<AppUser>
   provisionProfile?(input?: { displayName?: string; locale?: 'ar' | 'en'; termsAccepted?: boolean; termsVersion?: string }): Promise<AppUser>
   sendPasswordReset(email: string): Promise<void>
   requestEmailVerification(email: string, input?: { displayName?: string; locale?: 'ar' | 'en'; termsAccepted?: boolean; termsVersion?: string; termsAcceptedAt?: string }): Promise<{ success: boolean; status?: string; expiresAt?: string; resendAfterSeconds?: number; retryAfterSeconds?: number; error?: string }>
@@ -279,14 +314,17 @@ export type NotificationsAdapter = {
 }
 
 export type AdminAdapter = {
-  getPreauthState(): Promise<{ authenticated: boolean }>
-  submitPreauth(input: { username: string; password: string }): Promise<{ authenticated: boolean }>
+  onIdentityChanged(callback: () => void): () => void
+  getPreauthState(signal?: AbortSignal): Promise<{ authenticated: boolean }>
+  submitPreauth(input: { username: string; password: string }, signal?: AbortSignal): Promise<{ authenticated: boolean }>
   signInWithGoogle(): Promise<AppUser>
-  getSession(): Promise<AdminSession>
-  getDashboard(): Promise<AdminDashboardState>
-  getCommerceOverview(): Promise<AdminCommerceOverview>
-  listUsers(input?: { search?: string; page?: number; limit?: number; accountStatus?: string; verification?: string; subscription?: string; sort?: string }): Promise<{ items: AdminUserSummary[]; total: number; page: number; limit: number }>
-  listSubscriptions(input?: { search?: string; page?: number; limit?: number; lifecycle?: string; planTerm?: string; source?: string; current?: string; integrity?: string }): Promise<{ items: AdminSubscription[]; total: number; page: number; limit: number }>
+  getSession(signal?: AbortSignal): Promise<AdminSession>
+  getDashboard(signal?: AbortSignal): Promise<AdminDashboardState>
+  getCommercePage(input: AdminCommerceQuery, signal?: AbortSignal): Promise<AdminCommercePage>
+  getCommerceConfiguration(signal?: AbortSignal): Promise<AdminCommerceConfiguration>
+  getCommerceOrder(id: string, view?: AdminOrderRecordsView, page?: number, signal?: AbortSignal): Promise<AdminOrderDetail>
+  listUsers(input?: AdminUserDirectoryQuery, signal?: AbortSignal): Promise<{ items: AdminUserDirectoryItem[]; total: number; page: number; limit: number }>
+  listSubscriptions(input?: { id?: string; search?: string; page?: number; limit?: number; lifecycle?: string; planTerm?: string; source?: string; current?: string; integrity?: string }, signal?: AbortSignal): Promise<{ items: AdminSubscription[]; total: number; page: number; limit: number }>
   createSubscription(input: {
     user_email: string
     firebase_user_id?: string
@@ -297,9 +335,10 @@ export type AdminAdapter = {
   }): Promise<AdminSubscription>
   previewManualGrant(input: ManualGrantPreviewInput): Promise<ManualGrantPreview>
   executeManualGrant(input: ManualGrantExecuteInput): Promise<ManualGrantResult>
-  listPendingSubscriptionGrants(status?: PendingSubscriptionGrant['status'] | 'all'): Promise<PendingSubscriptionGrant[]>
+  listPendingSubscriptionGrants(status: PendingSubscriptionGrant['status'] | 'all', page: number, signal?: AbortSignal): Promise<{ items: PendingSubscriptionGrant[]; total: number; page: number; limit: number }>
   cancelPendingSubscriptionGrant(grantId: string, reason: string): Promise<PendingSubscriptionGrant>
-  listDeviceChangeRequests(status?: AdminDeviceChangeRequest['status'] | 'all'): Promise<AdminDeviceChangeRequest[]>
+  listDeviceChangeRequests(params?: { status?: AdminDeviceChangeFilter; page?: number; limit?: number }, signal?: AbortSignal): Promise<AdminDeviceChangePage>
+  getDeviceChangeRequest(requestId: string, signal?: AbortSignal): Promise<AdminDeviceChangeRequest>
   previewDeviceChange(requestId: string, input: { action: 'approve' | 'reject'; reason: string }): Promise<AdminDeviceChangePreview>
   executeDeviceChange(requestId: string, input: { action: 'approve' | 'reject'; reason: string; preview_hash: string; request_id: string }): Promise<{ item: AdminDeviceChangeRequest; idempotent: boolean }>
   previewDeviceReset(firebaseUid: string, reason: string): Promise<AdminDeviceResetPreview>
@@ -312,50 +351,59 @@ export type AdminAdapter = {
   previewSubscriptionTransition(subscriptionId: string, input: AdminOperationReason & { action: 'suspend' | 'resume' | 'cancel_at_period_end' | 'cancel_now' | 'end_trial' | 'correct_expiry' | 'revoke_entitlement'; new_expiry?: string }): Promise<AdminOperationPreview>
   executeSubscriptionTransition(subscriptionId: string, input: AdminOperationReason & { action: 'suspend' | 'resume' | 'cancel_at_period_end' | 'cancel_now' | 'end_trial' | 'correct_expiry' | 'revoke_entitlement'; new_expiry?: string; preview_hash: string; request_id: string }): Promise<Record<string, unknown>>
   resetHwid(id: string): Promise<AdminSubscription>
-  listPromoCodes(): Promise<AdminPromoCode[]>
-  createPromoCode(input: { code: string; discount_type: 'percent' | 'fixed'; discount_value: number; is_private_tier_trigger: boolean; max_uses?: number; expires_at?: string }): Promise<AdminPromoCode>
-  updatePromoCodeState(id: string, active: boolean, reason: string): Promise<AdminPromoCode>
-  listReleases(channel?: 'stable' | 'beta'): Promise<AdminReleaseManifest[]>
-  uploadRelease(input: { file: File; version: string; channel: string; artifactType?: 'portable' | 'installed' }): Promise<unknown>
+  listPromoDirectory(input: AdminPromoDirectoryQuery, signal?: AbortSignal): Promise<AdminPromoDirectoryPage>
+  createPromoCode(input: { code: string; title?: string; discount_type: 'percent' | 'fixed'; discount_value: number; is_private_tier_trigger: boolean; max_uses?: number; expires_at?: string }): Promise<AdminPromoCode>
+  updatePromoCodeState(id: string, active: boolean, reason: string, expectedUpdatedAt: string): Promise<AdminPromoCode>
+  listReleases(channel?: 'stable' | 'beta', signal?: AbortSignal): Promise<AdminReleaseManifest[]>
+  getStagedRelease(channel: 'stable' | 'beta', version: string, signal?: AbortSignal): Promise<AdminStagedReleaseArtifacts>
+  uploadRelease(input: { file: File; version: string; channel: string; artifactType: 'portable' | 'installed' }): Promise<AdminStagedReleaseArtifact>
   publishRelease(input: {
     version: string
     channel: string
     notes: string
     mandatory: boolean
     updateMode: 'optional' | 'force' | 'required' | 'silent'
+    reviewedArtifacts: AdminReviewedReleaseArtifacts
     targetScope?: 'all' | 'selected'
     targetUserEmails?: string[]
   }): Promise<AdminReleaseManifest>
   getRemoteControls(channel?: string): Promise<AdminRemoteControls>
   updateRemoteControls(input: AdminRemoteControls & { channel: string }): Promise<AdminRemoteControls>
-  listSupportThreads(): Promise<AdminSupportThread[]>
-  listSupportMessages(threadId: string): Promise<AdminSupportMessage[]>
+  listSupportInbox(input: AdminSupportInboxQuery, signal?: AbortSignal): Promise<AdminSupportInboxPage>
   downloadSupportAttachment(attachment: { id: string; filename: string }): Promise<void>
-  listSupportAudit(threadId: string): Promise<AdminSupportAuditEvent[]>
-  sendSupportReply(threadId: string, body: string, options?: { internal?: boolean; emailRequested?: boolean }): Promise<void>
-  updateSupportStatus(threadId: string, status: string, reason?: string): Promise<void>
+  getSupportConversation(threadId: string, signal?: AbortSignal): Promise<{ thread: AdminSupportThread; messages: AdminSupportMessage[]; unreadMessageIds: string[] }>
+  getSupportHistory(threadId: string, cursor: string | null, signal?: AbortSignal): Promise<{ events: AdminSupportAuditEvent[]; nextCursor: string | null }>
+  markSupportMessagesRead(threadId: string, ids: string[], signal?: AbortSignal): Promise<void>
+  sendSupportReply(threadId: string, body: string, options?: { internal?: boolean; emailRequested?: boolean; idempotencyKey?: string }): Promise<{ emailQueued?: boolean }>
+  updateSupportStatus(threadId: string, status: string, reason?: string, options?: { idempotencyKey?: string }): Promise<void>
   updateSupportPriority(threadId: string, priority: 'low' | 'normal' | 'high' | 'urgent'): Promise<void>
   setSupportBlocked(threadId: string, blocked: boolean, reason?: string): Promise<{ blocked: boolean; status?: string }>
-  getEmailOperations(): Promise<AdminEmailStatus>
-  processEmailOutbox(): Promise<{ processed: number; sent: number; skipped: number }>
-  retryEmailJob(jobId: string): Promise<{ processed?: number; sent?: number; skipped?: number }>
-  sendAdminTestEmail(input: { recipient: string; emailType?: string; locale?: 'ar' | 'en'; subject?: string; message?: string }): Promise<void>
+  getEmailConfiguration(signal?: AbortSignal): Promise<AdminEmailConfiguration>
+  listEmailActivity(input: AdminEmailActivityQuery, signal?: AbortSignal): Promise<AdminEmailActivityPage>
+  getEmailJob(jobId: string, signal?: AbortSignal): Promise<AdminEmailJobDetail>
+  processEmailOutbox(): Promise<AdminEmailQueueResult>
+  retryEmailJob(jobId: string): Promise<AdminEmailProcessingResult>
+  sendAdminTestEmail(input: { recipient: string; emailType?: string; locale?: 'ar' | 'en'; subject?: string; message?: string }): Promise<{ jobId: string; processing: AdminEmailProcessingResult }>
   listCrashLogs(filters?: AdminDiagnosticFilters, signal?: AbortSignal): Promise<AdminDiagnosticPage>
   getCrashLog(id: string, signal?: AbortSignal): Promise<AdminCrashLog>
-  listCrashGroups(filters?: AdminDiagnosticFilters): Promise<AdminDiagnosticPage<AdminCrashGroup>>
+  getDiagnosticTriage(params?: AdminDiagnosticFilters & { asOf?: string; summary?: boolean }, signal?: AbortSignal): Promise<AdminDiagnosticTriage>
+  getDiagnosticCoverage(period: AdminDiagnosticCoveragePeriod, signal?: AbortSignal): Promise<AdminDiagnosticCoverage>
   updateCrashGroupState(fingerprint: string, input: { status: AdminCrashGroup['status']; assignee?: string; note?: string }): Promise<AdminCrashGroup>
-  listTamperAlerts(input?: { page?: number; limit?: number; resolved?: boolean; severity?: string }): Promise<AdminTamperAlert[]>
+  listTamperAlerts(input?: AdminTamperAlertFilters, signal?: AbortSignal): Promise<AdminTamperAlertPage>
   resolveTamperAlert(alertId: string, reason: string): Promise<AdminTamperAlert>
-  listAuditLog(): Promise<AdminAuditLogItem[]>
-  getUserDetail(userKey: string): Promise<AdminUserDetail>
-  getReadiness(): Promise<AdminReadiness>
-  listInvites(status?: string): Promise<AdminInviteCode[]>
-  createInvite(input: { request_id: string; expires_at?: string; max_uses?: number; note?: string; scope?: AdminInviteCode['scope']; restrictions?: AdminInviteCode['restrictions'] }): Promise<{ item: AdminInviteCode; code: string | null; shown_once?: boolean }>
+  listAuditLog(filters?: AdminAuditFilters, signal?: AbortSignal): Promise<AdminAuditPage>
+  getUserDetail(userKey: string, signal?: AbortSignal): Promise<AdminUserDetail>
+  getReadiness(signal?: AbortSignal): Promise<AdminReadiness>
+  listInviteDirectory(query?: AdminInviteDirectoryQuery, signal?: AbortSignal): Promise<AdminInviteDirectoryPage>
+  getInviteDetail(inviteId: string, page?: number, signal?: AbortSignal): Promise<AdminInviteDetail>
+  createInvite(input: { request_id: string; expires_at?: string; max_uses?: number; note?: string; scope?: AdminInviteCode['scope']; restrictions?: AdminInviteCode['restrictions'] }): Promise<{ item: AdminInviteCode; code: string | null; shown_once?: boolean; replay?: boolean }>
   revokeInvite(inviteId: string, reason: string): Promise<void>
-  listInviteUsage(inviteId: string): Promise<AdminInviteUsage[]>
-  getPolicyState(): Promise<AdminPolicyState>
-  updateGlobalPolicy(input: { kill_switch_enabled: boolean; mandatory_update_enabled: boolean; minimum_supported_version?: string; update_mode: string; reason: string }): Promise<void>
-  updateDisabledVersion(input: { version: string; reason?: string; disabled: boolean }): Promise<void>
+  getPolicyDirectory(input: AdminPolicyDirectoryQuery, signal?: AbortSignal): Promise<AdminPolicyDirectory>
+  getPolicyVersion(version: string, signal?: AbortSignal): Promise<AdminPolicyVersionState>
+  getPolicyPlan(id: string, signal?: AbortSignal): Promise<AdminPolicyPlanDetail>
+  getGlobalPolicy(signal?: AbortSignal): Promise<AdminGlobalPolicy>
+  updateGlobalPolicy(input: AdminGlobalPolicyChange): Promise<{ success: boolean; request_id: string; revision: string; replay: boolean }>
+  updateDisabledVersion(input: AdminPolicyVersionChange): Promise<{ success: boolean; request_id: string; version: string; disabled: boolean; revision: string; replay: boolean }>
 }
 
 export type ContentAdapter = {

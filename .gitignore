@@ -6,4 +6,5 @@ site/*.tsbuildinfo
 workers/**/node_modules/
 workers/**/dist-worker/
 workers/**/.wrangler/
+/.wrangler/
 

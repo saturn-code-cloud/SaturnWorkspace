@@ -6,11 +6,19 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test:device-linking": "node scripts/check-device-linking.mjs",
+    "test:database": "node scripts/check-device-reset-sql.mjs && node scripts/check-promo-directory-sql.mjs && node scripts/check-user-directory-sql.mjs && node scripts/check-subscription-directory-sql.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5",
+      "undici": "7.30.1"
+    }
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260722.1",
+    "@electric-sql/pglite": "0.5.16",
     "typescript": "^5.8.3",
     "wrangler": "^4.115.0"
   }

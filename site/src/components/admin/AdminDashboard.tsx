@@ -769,7 +769,9 @@ export function AdminDashboard({ lang }: AdminDashboardProps) {
     try {
       const result = await processEmailOutbox()
       await refreshEmailOperations()
-      setNotice(isAr ? `تمت معالجة طابور البريد. المرسل: ${result.processed.sent}` : `Email outbox processed. Sent: ${result.processed.sent}`)
+      setNotice(result.processed.skipped === true
+        ? (isAr ? 'الطابور قيد المعالجة بالفعل.' : 'The queue is already being processed.')
+        : (isAr ? `تمت معالجة الطابور. قبل المزوّد ${result.processed.sent} رسالة.` : `Queue processed. The provider accepted ${result.processed.sent} messages.`))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'email_process_failed')
     } finally {
@@ -835,10 +837,9 @@ export function AdminDashboard({ lang }: AdminDashboardProps) {
   ]
 
   const kpiCards = [
-    { label: isAr ? 'المستخدمون النشطون' : 'Total Active Users', value: String(kpis.total_active_users ?? 0) },
+    { label: isAr ? 'حسابات مؤهّلة بالاشتراك' : 'Accounts with subscription access', value: String(kpis.total_active_users ?? '—') },
     { label: isAr ? 'إجمالي الإيراد' : 'Total Revenue', value: kpis.total_revenue != null ? `$${kpis.total_revenue}` : '--' },
-    { label: isAr ? 'المستخدمون المتوقفون' : 'Churned Users', value: String(kpis.churned_users ?? 0) },
-    { label: isAr ? 'تنبيهات العبث النشطة' : 'Active Tampering Alerts', value: String(kpis.active_tampering_alerts ?? 0) },
+    { label: isAr ? 'تنبيهات العبث النشطة' : 'Active Tampering Alerts', value: String(kpis.active_tampering_alerts ?? '—') },
   ]
 
   return (
@@ -1109,11 +1110,9 @@ export function AdminDashboard({ lang }: AdminDashboardProps) {
                       <div>{isAr ? 'الجهاز:' : 'Device:'} {selectedUser.request?.device_key || '--'}</div>
                       <div>{isAr ? 'آخر دخول:' : 'Last login:'} {formatEgyptDateTime(selectedUser.item?.last_seen_at || selectedUser.request?.last_event_at)}</div>
                       <div>{isAr ? 'حالة الطلب:' : 'Request status:'} {selectedUser.request?.status || '--'}</div>
-                      <div>{isAr ? 'آخر خطأ:' : 'Last crash:'} {formatEgyptDateTime(selectedUser.last_crash?.happened_at)}</div>
                       <div>{isAr ? 'الأجهزة:' : 'Devices:'} {selectedUser.devices.length}</div>
                       <div>{isAr ? 'الجلسات:' : 'Sessions:'} {selectedUser.sessions.length}</div>
                       <div>{isAr ? 'طلبات الدخول:' : 'Login requests:'} {selectedUser.login_requests.length}</div>
-                      <div>{isAr ? 'الأخطاء:' : 'Crashes:'} {selectedUser.crashes.length}</div>
                     </div>
                   </article>
                 ) : null}

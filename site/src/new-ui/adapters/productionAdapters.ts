@@ -1,3 +1,4 @@
+import { formatMoneyMinor } from '../../lib/money'
 import {
   GoogleAuthProvider,
   linkWithCredential,
@@ -14,32 +15,45 @@ import {
   createPromoCode,
   updatePromoCodeState,
   executeManualSubscriptionGrant,
-  fetchPendingSubscriptionGrants,
+  fetchPendingSubscriptionGrantPage,
   cancelPendingSubscriptionGrant as cancelPendingSubscriptionGrantRequest,
   fetchAdminDashboard,
-  fetchAdminCommerceOverview,
+  fetchAdminCommercePage,
+  fetchAdminCommerceConfiguration,
+  fetchAdminCommerceOrder,
   fetchAdminUsers,
   fetchAdminDeviceChangeRequests,
+  fetchAdminDeviceChangeRequest,
   fetchAdminPreauthState,
   fetchAdminSession,
   fetchAuditLog,
-  fetchCrashGroups,
+  fetchDiagnosticTriage,
+  fetchDiagnosticCoverage,
   fetchCrashLog,
   fetchCrashLogs,
-  fetchEmailOperations as fetchAdminEmailOperations,
-  fetchPromoCodes,
+  fetchAdminEmailConfiguration,
+  fetchAdminEmailActivity,
+  fetchAdminEmailJob,
+  fetchAdminPromoDirectory,
   fetchRemoteControls,
+  fetchCurrentAdminRelease,
+  fetchStagedAdminRelease,
   fetchSubscriptions,
-  fetchSupportMessages,
+  fetchAdminSupportConversation,
+  fetchAdminSupportHistory,
+  markAdminSupportMessagesRead,
+  fetchSupportInbox,
   downloadAdminSupportAttachment,
-  fetchSupportThreads,
   fetchUserDetail,
   fetchAdminReadiness,
   createAdminInvite,
-  fetchAdminInvites,
-  fetchAdminInviteUsage,
+  fetchAdminInviteDirectory,
+  fetchAdminInviteDetail,
   revokeAdminInvite,
-  fetchAdminPolicyState,
+  fetchAdminPolicyDirectory,
+  fetchAdminPolicyVersion,
+  fetchAdminPolicyPlan,
+  fetchAdminGlobalPolicy,
   updateAdminDisabledVersion,
   updateAdminGlobalPolicy,
   fetchTamperAlerts,
@@ -59,7 +73,6 @@ import {
   resetSubscriptionHwid,
   sendSupportReply,
   sendAdminTestEmail as sendAdminTestEmailRequest,
-  setAdminBearerToken,
   setSupportBlocked,
   processEmailOutbox as processEmailOutboxRequest,
   retryEmailJob as retryEmailJobRequest,
@@ -70,7 +83,6 @@ import {
   uploadReleaseBinary,
   patchSubscriptionStatus,
   previewManualSubscriptionGrant,
-  type AdminReleaseManifest,
 } from '../../api/admin'
 import { createPaymentIntent, fetchPlanCatalog, type PlanCatalogItem } from '../../api/payments'
 import { fetchProtectedReleaseCatalog, fetchProtectedReleaseFile, type ProtectedRelease } from '../../api/downloads'
@@ -98,7 +110,30 @@ import { publicCopy } from '../content/publicCopy'
 import { legalPageContent } from '../content/legalContent'
 import { isProductionFeatureEnabled, productionFeatureFlags } from './productionFeatureFlags'
 import type { AccountSubscription } from '../../api/account'
+import type { AdminEmailProcessingResult } from '../../api/admin'
 import type { AppAdapters, AppUser, AuthState, PlanInfo, ReleaseInfo, SignUpWithEmailInput, SupportSenderRole } from './contracts'
+
+function emailProcessingResult(value: unknown, single = false): AdminEmailProcessingResult {
+  if (!value || typeof value !== 'object') throw new Error('email_action_unconfirmed')
+  const result = value as AdminEmailProcessingResult
+  if (![result.processed, result.sent, result.skipped].every((count) => Number.isSafeInteger(count) && count >= 0)) throw new Error('email_action_unconfirmed')
+  // A single-message result counts attempts; a batch result counts jobs selected.
+  const valid = single
+    ? (result.processed === 1 && result.skipped === 0 && result.sent <= 1) ||
+      (result.processed === 0 && result.sent === 0 && result.skipped === 1)
+    : result.sent <= result.processed - result.skipped
+  if (!valid) throw new Error('email_action_unconfirmed')
+  return result
+}
+
+function confirmedOperation(
+  data: { success: boolean; result: Record<string, unknown> } | null | undefined,
+  requestId: string,
+  matches: (result: Record<string, unknown>) => boolean,
+) {
+  if (data?.success !== true || data.result?.request_id !== requestId || !matches(data.result)) throw new Error('admin_operation_unconfirmed')
+  return data.result
+}
 
 function userFromFirebase(user: typeof firebaseAuth.currentUser): AppUser {
   if (!user?.email) throw new Error('auth_user_missing_email')
@@ -341,14 +376,6 @@ function normalizeProtectedRelease(release: ProtectedRelease): ReleaseInfo {
   }
 }
 
-function formatCatalogMoney(amountMinor: number | null | undefined, currency: string, locale: 'ar' | 'en') {
-  if (!Number.isFinite(amountMinor)) return ''
-  return new Intl.NumberFormat(locale === 'ar' ? 'ar-EG' : 'en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: 2,
-  }).format(Number(amountMinor) / 100)
-}
 
 function catalogPeriod(plan: PlanCatalogItem, locale: 'ar' | 'en') {
   const labels = {
@@ -364,10 +391,10 @@ function mapCatalogPlan(plan: PlanCatalogItem, locale: 'ar' | 'en'): PlanInfo {
     id: plan.id,
     version: plan.version,
     name: localized.name || plan.name,
-    price: formatCatalogMoney(plan.amount_minor, plan.currency, locale),
+    price: formatMoneyMinor(plan.amount_minor, plan.currency, locale),
     originalPrice: plan.original_amount_minor == null
       ? undefined
-      : formatCatalogMoney(plan.original_amount_minor, plan.currency, locale),
+      : formatMoneyMinor(plan.original_amount_minor, plan.currency, locale),
     period: catalogPeriod(plan, locale),
     description: localized.description || plan.description,
     trialDays: plan.trial_days,
@@ -465,7 +492,9 @@ export const productionAdapters: AppAdapters = {
     async signInWithGoogle(input = {}) {
       try {
         await firebaseAuthPersistenceReady
-        const result = await signInWithPopup(firebaseAuth, new GoogleAuthProvider())
+        const provider = new GoogleAuthProvider()
+        if (input.selectAccount) provider.setCustomParameters({ prompt: 'select_account' })
+        const result = await signInWithPopup(firebaseAuth, provider)
         const shouldProvisionProfile = input.provisionProfile !== false || Boolean(input.termsAccepted)
         if (!shouldProvisionProfile) return userFromFirebase(result.user)
         try {
@@ -536,7 +565,6 @@ export const productionAdapters: AppAdapters = {
     },
     async signOut() {
       publishAuthState({ ...currentAuthState, status: 'signing_out' })
-      setAdminBearerToken(null)
       clearAccountBootstrap()
       pendingProviderLink = null
       await signOut(firebaseAuth)
@@ -776,38 +804,51 @@ export const productionAdapters: AppAdapters = {
     },
   },
   admin: {
-    async getPreauthState() {
-      const state = await fetchAdminPreauthState()
-      return { authenticated: Boolean(state.authenticated) }
+    onIdentityChanged(callback) {
+      let previous: string | null | undefined
+      return onAuthStateChanged(firebaseAuth, (user) => {
+        const next = user?.uid || null
+        if (previous !== undefined && next !== previous) callback()
+        previous = next
+      })
     },
-    async submitPreauth(input) {
-      const state = await submitAdminPreauth(input)
-      return { authenticated: Boolean(state.authenticated) }
+    async getPreauthState(signal) {
+      const state = await fetchAdminPreauthState(signal)
+      return { authenticated: state.authenticated }
+    },
+    async submitPreauth(input, signal) {
+      const state = await submitAdminPreauth(input, signal)
+      return { authenticated: state.authenticated }
     },
     async signInWithGoogle() {
-      const user = await productionAdapters.auth.signInWithGoogle({ provisionProfile: false })
-      const token = await productionAdapters.auth.getIdToken(false)
-      setAdminBearerToken(token)
+      const user = await productionAdapters.auth.signInWithGoogle({ provisionProfile: false, selectAccount: true })
       return user
     },
-    async getSession() {
-      const session = await fetchAdminSession()
+    async getSession(signal) {
+      const session = await fetchAdminSession(signal)
       return session
     },
-    async getDashboard() {
-      const data = await fetchAdminDashboard()
-      return { kpis: data.kpis, recentActivity: data.recent_activity as never, degradedResources: (data as { degraded_resources?: string[] }).degraded_resources }
+    async getDashboard(signal) {
+      const data = await fetchAdminDashboard(signal)
+      return { kpis: data.kpis, recentActivity: data.recent_activity, degradedResources: data.degraded_resources, subscriptionCountLimited: data.subscription_count_limited }
     },
-    async getCommerceOverview() {
-      return fetchAdminCommerceOverview()
+    getCommercePage: fetchAdminCommercePage,
+    getCommerceConfiguration: fetchAdminCommerceConfiguration,
+    getCommerceOrder: fetchAdminCommerceOrder,
+    async listUsers(input = {}, signal) {
+      const data = await fetchAdminUsers(input, signal)
+      return { items: data.items, total: data.total, page: data.page, limit: data.limit }
     },
-    async listUsers(input = {}) {
-      const data = await fetchAdminUsers(input)
-      return { items: data.items || [], total: data.total || 0, page: data.page || 1, limit: data.limit || input.limit || 50 }
-    },
-    async listSubscriptions(input = {}) {
-      const data = await fetchSubscriptions(input)
-      return { items: data.items || [], total: data.total || 0, page: data.page || 1, limit: data.limit || input.limit || 50 }
+    async listSubscriptions(input = {}, signal) {
+      const query = { ...input, id: input.id?.toLowerCase(), page: input.page ?? 1, limit: input.limit ?? 25 }
+      const data = await fetchSubscriptions(query, signal, true)
+      if (data?.success !== true || data.view !== 'directory' || data.page !== query.page || data.limit !== query.limit ||
+          !Number.isSafeInteger(data.total) || data.total < 0 || !Array.isArray(data.items) ||
+          data.items.length !== Math.min(query.limit, Math.max(0, data.total - (query.page - 1) * query.limit)) ||
+          !data.items.every((item) => typeof item?.id === 'string' && item.id && typeof item.user_email === 'string' && typeof item.is_current_record === 'boolean') ||
+          new Set(data.items.map(({ id }) => id)).size !== data.items.length ||
+          (query.id && (data.total > 1 || data.items.some((row) => row.id !== query.id)))) throw new Error('subscriptions_unavailable')
+      return { items: data.items, total: data.total, page: data.page, limit: data.limit }
     },
     async createSubscription(input) {
       const data = await createSubscription(input)
@@ -818,28 +859,43 @@ export const productionAdapters: AppAdapters = {
       return data.preview
     },
     async executeManualGrant(input) {
-      return executeManualSubscriptionGrant(input)
+      const data = await executeManualSubscriptionGrant(input)
+      const email = (input.target_email || '').trim().toLowerCase()
+      const item = data?.item
+      const pending = data?.pending_grant
+      const returnedEmail = item?.user_email || pending?.normalized_email
+      const recordId = item?.id || pending?.id
+      const matches = input.target_firebase_uid
+        ? item?.firebase_user_id === input.target_firebase_uid
+        : Boolean(email) && typeof returnedEmail === 'string' && returnedEmail.trim().toLowerCase() === email
+      if (data?.success !== true || typeof data.request_id !== 'string' || !data.request_id.trim() ||
+          typeof recordId !== 'string' || !recordId || Boolean(item) === Boolean(pending) || !matches) throw new Error('admin_operation_unconfirmed')
+      return data
     },
-    async listPendingSubscriptionGrants(status = 'pending') {
-      return (await fetchPendingSubscriptionGrants(status)).items || []
-    },
+    listPendingSubscriptionGrants: fetchPendingSubscriptionGrantPage,
     async cancelPendingSubscriptionGrant(grantId, reason) {
-      return (await cancelPendingSubscriptionGrantRequest({ grant_id: grantId, reason })).item
+      const data = await cancelPendingSubscriptionGrantRequest({ grant_id: grantId, reason })
+      if (data?.success !== true || data.item?.id !== grantId || data.item.status !== 'cancelled') throw new Error('admin_operation_unconfirmed')
+      return data.item
     },
-    async listDeviceChangeRequests(status = 'pending') {
-      return (await fetchAdminDeviceChangeRequests({ status })).items || []
-    },
+    listDeviceChangeRequests: fetchAdminDeviceChangeRequests,
+    getDeviceChangeRequest: fetchAdminDeviceChangeRequest,
     async previewDeviceChange(requestId, input) {
       return (await previewAdminDeviceChange(requestId, input)).preview
     },
     async executeDeviceChange(requestId, input) {
-      return (await executeAdminDeviceChange(requestId, input)).result
+      const data = await executeAdminDeviceChange(requestId, input)
+      const status = input.action === 'approve' ? 'approved' : 'rejected'
+      if (data?.success !== true || data.result?.item?.id !== requestId || data.result.item.status !== status || typeof data.result.idempotent !== 'boolean') throw new Error('admin_operation_unconfirmed')
+      return data.result
     },
     async previewDeviceReset(firebaseUid, reason) {
       return (await previewAdminDeviceReset(firebaseUid, reason)).preview
     },
     async executeDeviceReset(firebaseUid, input) {
-      return (await executeAdminDeviceReset(firebaseUid, input)).result
+      const data = await executeAdminDeviceReset(firebaseUid, input)
+      if (data?.success !== true || data.result?.reset !== true || typeof data.result.idempotent !== 'boolean') throw new Error('admin_operation_unconfirmed')
+      return data.result
     },
     async updateSubscriptionStatus(id, status) {
       const data = await patchSubscriptionStatus(id, status)
@@ -849,40 +905,81 @@ export const productionAdapters: AppAdapters = {
       return (await previewAccountLifecycleRequest(firebaseUid, input)).preview
     },
     async executeAccountLifecycle(firebaseUid, input) {
-      return (await executeAccountLifecycleRequest(firebaseUid, input)).result
+      const data = await executeAccountLifecycleRequest(firebaseUid, input)
+      const status = input.action === 'suspend' ? 'suspended' : input.action === 'reactivate' ? 'active' : 'pending_deletion'
+      return confirmedOperation(data, input.request_id, (result) => {
+        const account = result.account as { firebase_uid?: string; account_status?: string } | null
+        return account?.firebase_uid === firebaseUid && account.account_status === status
+      })
     },
     async previewAccessRevocation(firebaseUid, input) {
       return (await previewAccessRevocationRequest(firebaseUid, input)).preview
     },
     async executeAccessRevocation(firebaseUid, input) {
-      return (await executeAccessRevocationRequest(firebaseUid, input)).result
+      const data = await executeAccessRevocationRequest(firebaseUid, input)
+      return confirmedOperation(data, input.request_id, (result) => result.scope === input.scope &&
+        [result.sessions_revoked, result.device_requests_revoked].every((count) => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0))
     },
     async previewSubscriptionTransition(subscriptionId, input) {
       return (await previewSubscriptionTransitionRequest(subscriptionId, input)).preview
     },
     async executeSubscriptionTransition(subscriptionId, input) {
-      return (await executeSubscriptionTransitionRequest(subscriptionId, input)).result
+      const data = await executeSubscriptionTransitionRequest(subscriptionId, input)
+      return confirmedOperation(data, input.request_id, (result) =>
+        (result.subscription as { id?: string } | null)?.id === subscriptionId)
     },
     async resetHwid(id) {
       const data = await resetSubscriptionHwid(id)
       return data.item
     },
-    async listPromoCodes() {
-      const data = await fetchPromoCodes()
-      return data.items || []
-    },
+    listPromoDirectory: fetchAdminPromoDirectory,
     async createPromoCode(input) {
-      return (await createPromoCode(input)).item
+      const result = await createPromoCode(input)
+      if (result?.success !== true || result.item?.code !== input.code.trim() || !result.item.id || !Number.isFinite(Date.parse(result.item.updated_at || ''))) throw new Error('promo_save_unconfirmed')
+      return result.item
     },
-    async updatePromoCodeState(id, active, reason) {
-      return (await updatePromoCodeState(id, active, reason)).item
+    async updatePromoCodeState(id, active, reason, expectedUpdatedAt) {
+      const result = await updatePromoCodeState(id, active, reason, expectedUpdatedAt)
+      if (result?.success !== true || result.item?.id !== id || result.item.is_active !== active || !Number.isFinite(Date.parse(result.item.updated_at || ''))) throw new Error('promo_save_unconfirmed')
+      return result.item
     },
-    async listReleases(channel = 'beta') {
-      const data = await fetchRemoteControls(channel)
-      return data.channel_manifest ? [data.channel_manifest as AdminReleaseManifest] : []
+    async listReleases(channel = 'beta', signal) {
+      const data = await fetchCurrentAdminRelease(channel, signal)
+      const artifacts = data?.item?.artifacts
+      if (data?.success !== true || data.channel !== channel || data.item?.channel !== channel ||
+          typeof data.item.available !== 'boolean' || typeof data.item.version !== 'string' ||
+          typeof data.item.disabled !== 'boolean' || typeof data.item.disabled_reason !== 'string' ||
+          typeof data.item.mandatory !== 'boolean' || typeof data.item.notes !== 'string' ||
+          (['filename', 'download_url', 'download_sha256'] as const).some((key) => typeof data.item[key] !== 'string') ||
+          (data.item.published_at !== null && (typeof data.item.published_at !== 'string' || !Number.isFinite(Date.parse(data.item.published_at)))) ||
+          !artifacts || Array.isArray(artifacts) || (['installed', 'portable'] as const).some((kind) => {
+            const artifact = artifacts[kind]
+            return artifact !== undefined && (!artifact || typeof artifact !== 'object' || Array.isArray(artifact) ||
+              (['filename', 'url', 'sha256', 'package_type'] as const).some((key) => Object.hasOwn(artifact, key) && typeof artifact[key] !== 'string') ||
+              artifact.size_bytes !== undefined && (!Number.isSafeInteger(artifact.size_bytes) || artifact.size_bytes < 0))
+          })) {
+        throw new Error('release_channel_unavailable')
+      }
+      return [data.item]
+    },
+    async getStagedRelease(channel, version, signal) {
+      const data = await fetchStagedAdminRelease(channel, version, signal)
+      if (!data?.success || data.channel !== channel || data.version !== version || !data.artifacts ||
+          (['portable', 'installed'] as const).some((kind) => {
+            const artifact = data.artifacts[kind]
+            return artifact !== null && (!artifact || typeof artifact.filename !== 'string' || !artifact.filename ||
+              !Number.isSafeInteger(artifact.size_bytes) || artifact.size_bytes < 0 || !/^[a-f0-9]{64}$/.test(artifact.revision))
+          })) throw new Error('release_staging_unavailable')
+      return data.artifacts
     },
     async uploadRelease(input) {
-      return uploadReleaseBinary({ file: input.file, version: input.version, channel: input.channel, artifact_type: input.artifactType })
+      const data = await uploadReleaseBinary({ file: input.file, version: input.version, channel: input.channel, artifact_type: input.artifactType })
+      if (!data?.success || data.artifact_type !== input.artifactType || data.release?.version !== input.version ||
+          data.release.channel !== input.channel || data.release.size !== input.file.size ||
+          !/^[a-f0-9]{64}$/i.test(data.release.sha256) || !data.staged_artifact ||
+          data.staged_artifact.filename !== data.release.filename || data.staged_artifact.size_bytes !== input.file.size ||
+          !/^[a-f0-9]{64}$/.test(data.staged_artifact.revision)) throw new Error('release_upload_unconfirmed')
+      return data.staged_artifact
     },
     async publishRelease(input) {
       const data = await publishRelease({
@@ -891,9 +988,13 @@ export const productionAdapters: AppAdapters = {
         notes: input.notes,
         mandatory: input.mandatory,
         update_mode: input.updateMode,
+        reviewed_artifacts: input.reviewedArtifacts,
         target_scope: input.targetScope,
         target_user_emails: input.targetUserEmails,
       })
+      const published = data?.manifest?.channels?.[input.channel]
+      if (!data?.success || !data.manifest || (input.targetScope !== 'selected' &&
+          (published?.version !== input.version || !published.available))) throw new Error('release_publish_unconfirmed')
       return data.manifest
     },
     async getRemoteControls(channel = 'beta') {
@@ -904,53 +1005,54 @@ export const productionAdapters: AppAdapters = {
       const data = await updateRemoteControls(input)
       return data.controls
     },
-    async listSupportThreads() {
-      const data = await fetchSupportThreads()
-      return data.threads || []
-    },
-    async listSupportMessages(threadId) {
-      const data = await fetchSupportMessages(threadId)
-      return data.messages || []
-    },
+    listSupportInbox: fetchSupportInbox,
     async downloadSupportAttachment(attachment) {
       await downloadAdminSupportAttachment(attachment)
     },
-    async listSupportAudit(threadId) {
-      const data = await fetchSupportMessages(threadId)
-      return data.audit || []
-    },
+    getSupportConversation: fetchAdminSupportConversation,
+    getSupportHistory: fetchAdminSupportHistory,
+    markSupportMessagesRead: markAdminSupportMessagesRead,
     async sendSupportReply(threadId, body, options = {}) {
-      await sendSupportReply({ thread_id: threadId, body, internal_note: options.internal, email_requested: options.emailRequested })
+      const result = await sendSupportReply({ thread_id: threadId, body, internal_note: options.internal, email_requested: options.emailRequested, idempotency_key: options.idempotencyKey })
+      if (result?.success !== true) throw new Error('support_reply_failed')
+      return { emailQueued: typeof result.email_queued === 'boolean' ? result.email_queued : undefined }
     },
-    async updateSupportStatus(threadId, status, reason) {
-      await updateAdminSupportStatus({ thread_id: threadId, status, reason })
+    async updateSupportStatus(threadId, status, reason, options = {}) {
+      const result = await updateAdminSupportStatus({ thread_id: threadId, status, reason, idempotency_key: options.idempotencyKey })
+      if (result?.success !== true || result.status !== status) throw new Error('support_status_failed')
     },
     async updateSupportPriority(threadId, priority) {
-      await updateAdminSupportPriority({ thread_id: threadId, priority })
+      const result = await updateAdminSupportPriority({ thread_id: threadId, priority })
+      if (result?.success !== true || result.priority !== priority) throw new Error('support_priority_failed')
     },
     async setSupportBlocked(threadId, blocked, reason) {
       const result = await setSupportBlocked({ thread_id: threadId, blocked, reason })
+      if (result?.success !== true || result.blocked !== blocked) throw new Error('support_block_failed')
       return { blocked: Boolean(result.blocked), status: result.status }
     },
-    getEmailOperations() {
-      return fetchAdminEmailOperations()
-    },
+    getEmailConfiguration: fetchAdminEmailConfiguration,
+    listEmailActivity: fetchAdminEmailActivity,
+    getEmailJob: fetchAdminEmailJob,
     async processEmailOutbox() {
       const data = await processEmailOutboxRequest()
-      return data.processed
+      if (data?.success !== true) throw new Error('email_action_unconfirmed')
+      return data.processed?.skipped === true ? { skipped: true } : emailProcessingResult(data.processed)
     },
     async retryEmailJob(jobId) {
       const data = await retryEmailJobRequest(jobId)
-      return data.processed || {}
+      if (data?.success !== true || data.job_id !== jobId) throw new Error('email_action_unconfirmed')
+      return emailProcessingResult(data.processed, true)
     },
     async sendAdminTestEmail(input) {
-      await sendAdminTestEmailRequest({
+      const data = await sendAdminTestEmailRequest({
         recipient: input.recipient,
         email_type: input.emailType,
         locale: input.locale,
         subject: input.subject,
         message: input.message,
       })
+      if (data?.success !== true || typeof data.job_id !== 'string' || !data.job_id) throw new Error('email_action_unconfirmed')
+      return { jobId: data.job_id, processing: emailProcessingResult(data.processed, true) }
     },
     listCrashLogs(filters = {}, signal) {
       return fetchCrashLogs(filters, signal)
@@ -958,50 +1060,44 @@ export const productionAdapters: AppAdapters = {
     async getCrashLog(id, signal) {
       return (await fetchCrashLog(id, signal)).item
     },
-    listCrashGroups(filters = {}) {
-      return fetchCrashGroups(filters)
-    },
+    getDiagnosticTriage: fetchDiagnosticTriage,
+    getDiagnosticCoverage: fetchDiagnosticCoverage,
     async updateCrashGroupState(fingerprint, input) {
-      return (await updateCrashGroupStateRequest(fingerprint, input)).item
+      const data = await updateCrashGroupStateRequest(fingerprint, input)
+      if (data?.success !== true || data.item?.fingerprint !== fingerprint || data.item.status !== input.status ||
+          (data.item.assignee || '') !== (input.assignee || '').trim() || (data.item.note || '') !== (input.note || '').trim()) throw new Error('admin_operation_unconfirmed')
+      return data.item
     },
-    async listTamperAlerts(input = {}) {
-      return (await fetchTamperAlerts(input)).items || []
-    },
+    listTamperAlerts: fetchTamperAlerts,
     async resolveTamperAlert(alertId, reason) {
-      return (await resolveTamperAlertRequest(alertId, reason)).item
+      const data = await resolveTamperAlertRequest(alertId, reason)
+      if (data?.success !== true || data.item?.id !== alertId || data.item.resolved !== true) throw new Error('admin_operation_unconfirmed')
+      return data.item
     },
-    async listAuditLog() {
-      const data = await fetchAuditLog()
-      return data.items || []
+    listAuditLog: fetchAuditLog,
+    getUserDetail: fetchUserDetail,
+    getReadiness(signal) {
+      return fetchAdminReadiness(signal)
     },
-    getUserDetail(userKey) {
-      return fetchUserDetail(userKey)
-    },
-    getReadiness() {
-      return fetchAdminReadiness()
-    },
-    async listInvites(status = '') {
-      return (await fetchAdminInvites(status)).items || []
-    },
+    listInviteDirectory: fetchAdminInviteDirectory,
+    getInviteDetail: fetchAdminInviteDetail,
     async createInvite(input) {
       const result = await createAdminInvite(input)
-      return { item: result.item, code: result.code, shown_once: result.shown_once }
+      return { item: result.item, code: result.code, shown_once: result.shown_once, replay: result.replay }
     },
     async revokeInvite(inviteId, reason) {
       await revokeAdminInvite(inviteId, reason)
     },
-    async listInviteUsage(inviteId) {
-      return (await fetchAdminInviteUsage(inviteId)).items || []
+    getPolicyDirectory: fetchAdminPolicyDirectory,
+    getPolicyVersion: fetchAdminPolicyVersion,
+    getPolicyPlan: fetchAdminPolicyPlan,
+    getGlobalPolicy(signal) {
+      return fetchAdminGlobalPolicy(signal)
     },
-    getPolicyState() {
-      return fetchAdminPolicyState()
+    updateGlobalPolicy(input) {
+      return updateAdminGlobalPolicy(input)
     },
-    async updateGlobalPolicy(input) {
-      await updateAdminGlobalPolicy(input)
-    },
-    async updateDisabledVersion(input) {
-      await updateAdminDisabledVersion(input)
-    },
+    updateDisabledVersion: updateAdminDisabledVersion,
   },
   content: {
     async getLegalPage(page, locale) {

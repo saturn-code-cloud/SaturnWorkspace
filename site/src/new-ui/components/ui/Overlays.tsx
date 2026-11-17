@@ -8,34 +8,61 @@ function useEscape(open: boolean, onClose: () => void, dialogRef: RefObject<HTML
     if (!open) return
     const handler = (event: KeyboardEvent) => {
       const dialogs = document.querySelectorAll('[role="dialog"][aria-modal="true"]')
-      if (event.key === 'Escape' && dialogs[dialogs.length - 1] === dialogRef.current) onClose()
+      if (event.key === 'Escape' && !event.defaultPrevented && !event.isComposing &&
+          dialogs[dialogs.length - 1] === dialogRef.current) {
+        event.preventDefault()
+        onClose()
+      }
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
   }, [open, onClose, dialogRef])
 }
 
-function useOverlayLifecycle(open: boolean, dialogRef: RefObject<HTMLElement | null>) {
+const openDialogs = new Set<HTMLElement>()
+let overflowBeforeDialogs = ''
+
+function useOverlayLifecycle(open: boolean, dialogRef: RefObject<HTMLElement | null>, initialFocusRef?: RefObject<HTMLElement | null>) {
   useEffect(() => {
-    if (!open) return
+    const dialog = dialogRef.current
+    if (!open || !dialog) return
     const previousFocus = document.activeElement as HTMLElement | null
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    window.requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLElement>('button, input, select, textarea, [tabindex]:not([tabindex="-1"])')?.focus())
-    return () => {
-      document.body.style.overflow = previousOverflow
-      previousFocus?.focus()
+    if (!openDialogs.size) {
+      overflowBeforeDialogs = document.body.style.overflow
+      document.body.style.overflow = 'hidden'
     }
-  }, [open, dialogRef])
+    openDialogs.add(dialog)
+    const firstControl = (root: HTMLElement) => root.querySelector<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')
+    const frame = window.requestAnimationFrame(() => {
+      if (Array.from(openDialogs).at(-1) === dialog) (initialFocusRef?.current ?? firstControl(dialog))?.focus({ preventScroll: true })
+    })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      const wasTop = Array.from(openDialogs).at(-1) === dialog
+      openDialogs.delete(dialog)
+      if (!openDialogs.size) document.body.style.overflow = overflowBeforeDialogs
+      if (!wasTop) return
+      const next = Array.from(openDialogs).at(-1)
+      if (previousFocus?.isConnected && (!next || next.contains(previousFocus))) previousFocus.focus({ preventScroll: true })
+      else if (next?.isConnected) firstControl(next)?.focus({ preventScroll: true })
+    }
+  }, [open, dialogRef, initialFocusRef])
 }
 
 function trapDialogFocus(event: ReactKeyboardEvent<HTMLElement>) {
   if (event.key !== 'Tab') return
-  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
-  if (!focusable.length) return
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('a[href]:not([tabindex="-1"]), button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
+  if (!focusable.length) {
+    event.preventDefault()
+    return
+  }
   const first = focusable[0]
   const last = focusable[focusable.length - 1]
-  if (event.shiftKey && document.activeElement === first) {
+  if (!focusable.includes(document.activeElement as HTMLElement)) {
+    event.preventDefault()
+    const next = event.shiftKey ? last : first
+    next.focus()
+  } else if (event.shiftKey && document.activeElement === first) {
     event.preventDefault()
     last.focus()
   } else if (!event.shiftKey && document.activeElement === last) {
@@ -44,21 +71,28 @@ function trapDialogFocus(event: ReactKeyboardEvent<HTMLElement>) {
   }
 }
 
-export function Modal({ open, onClose, title, description, closeLabel, children, footer, size = 'md' }: { open: boolean; onClose: () => void; title: string; description?: string; closeLabel: string; children: ReactNode; footer?: ReactNode; size?: 'sm' | 'md' | 'lg' }) {
+export function Modal({ open, onClose, title, description, closeLabel, closeDisabled = false, children, footer, size = 'md', initialFocusRef }: { open: boolean; onClose: () => void; title: string; description?: string; closeLabel: string; closeDisabled?: boolean; children: ReactNode; footer?: ReactNode; size?: 'sm' | 'md' | 'lg'; initialFocusRef?: RefObject<HTMLElement | null> }) {
   const dialogRef = useRef<HTMLElement | null>(null)
   const titleId = useId()
-  useEscape(open, onClose, dialogRef)
-  useOverlayLifecycle(open, dialogRef)
+  useEscape(open && !closeDisabled, onClose, dialogRef)
+  useOverlayLifecycle(open, dialogRef, initialFocusRef)
+  useEffect(() => {
+    if (open && closeDisabled) dialogRef.current?.focus()
+  }, [open, closeDisabled])
   if (!open) return null
-  return createPortal(<div className="ui-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section ref={dialogRef} className={`ui-modal ui-modal--${size}`} role="dialog" aria-modal="true" aria-labelledby={titleId} onKeyDown={trapDialogFocus}><header><div><h2 id={titleId}>{title}</h2>{description ? <p>{description}</p> : null}</div><IconButton label={closeLabel} onClick={onClose}><X size={18} /></IconButton></header><div className="ui-modal__body">{children}</div>{footer ? <footer>{footer}</footer> : null}</section></div>, document.body)
+  return createPortal(<div className="ui-overlay" role="presentation" onMouseDown={(event) => { if (!closeDisabled && event.target === event.currentTarget) onClose() }}><section ref={dialogRef} className={`ui-modal ui-modal--${size}`} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={closeDisabled ? -1 : undefined} onKeyDown={trapDialogFocus}><header><div><h2 id={titleId}>{title}</h2>{description ? <p>{description}</p> : null}</div><IconButton label={closeLabel} onClick={onClose} disabled={closeDisabled}><X size={18} /></IconButton></header><div className="ui-modal__body">{children}</div>{footer ? <footer>{footer}</footer> : null}</section></div>, document.body)
 }
 
-export function Drawer({ open, onClose, title, description, closeLabel, children, footer, className = '' }: { open: boolean; onClose: () => void; title: string; description?: string; closeLabel: string; children: ReactNode; footer?: ReactNode; className?: string }) {
+export function Drawer({ open, onClose, title, description, closeLabel, closeDisabled = false, children, footer, className = '' }: { open: boolean; onClose: () => void; title: string; description?: string; closeLabel: string; closeDisabled?: boolean; children: ReactNode; footer?: ReactNode; className?: string }) {
   const dialogRef = useRef<HTMLElement | null>(null)
-  useEscape(open, onClose, dialogRef)
+  const titleId = useId()
+  useEscape(open && !closeDisabled, onClose, dialogRef)
   useOverlayLifecycle(open, dialogRef)
+  useEffect(() => {
+    if (open && closeDisabled) dialogRef.current?.focus({ preventScroll: true })
+  }, [open, closeDisabled])
   if (!open) return null
-  return createPortal(<div className="ui-overlay ui-overlay--drawer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><aside ref={dialogRef} className={`ui-drawer ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby="drawer-title" onKeyDown={trapDialogFocus}><header><div><h2 id="drawer-title">{title}</h2>{description ? <p>{description}</p> : null}</div><IconButton label={closeLabel} onClick={onClose}><X size={18} /></IconButton></header><div className="ui-drawer__body">{children}</div>{footer ? <footer>{footer}</footer> : null}</aside></div>, document.body)
+  return createPortal(<div className="ui-overlay ui-overlay--drawer" role="presentation" onMouseDown={(event) => { if (!closeDisabled && event.target === event.currentTarget) onClose() }}><aside ref={dialogRef} className={`ui-drawer ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? titleId + '-description' : undefined} tabIndex={closeDisabled ? -1 : undefined} onKeyDown={trapDialogFocus}><header><div><h2 id={titleId}>{title}</h2>{description ? <p id={titleId + '-description'}>{description}</p> : null}</div><IconButton label={closeLabel} onClick={onClose} disabled={closeDisabled}><X size={18} /></IconButton></header><div className="ui-drawer__body">{children}</div>{footer ? <footer>{footer}</footer> : null}</aside></div>, document.body)
 }
 
 export function ConfirmDialog({ open, onClose, title, body, confirmLabel, cancelLabel, onConfirm, destructive }: { open: boolean; onClose: () => void; title: string; body: string; confirmLabel: string; cancelLabel: string; onConfirm: () => void; destructive?: boolean }) {
@@ -114,7 +148,7 @@ export function Dropdown({ label, trigger, children }: { label: string; trigger:
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : event.key === 'ArrowDown' ? (current + 1) % items.length : (current <= 0 ? items.length - 1 : current - 1)
     items[next]?.focus()
   }
-  return <div ref={rootRef} className="ui-dropdown"><button ref={triggerRef} type="button" className="ui-dropdown__trigger" aria-label={label} aria-haspopup="menu" aria-expanded={open} onKeyDown={(event) => { if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openMenu() } }} onClick={() => open ? closeMenu() : openMenu()}>{trigger}</button>{open ? <div className="ui-popover ui-dropdown__menu" role="menu" onKeyDown={navigateMenu} onClick={() => closeMenu()}>{children}</div> : null}</div>
+  return <div ref={rootRef} className="ui-dropdown"><button ref={triggerRef} type="button" className="ui-dropdown__trigger" aria-label={label} aria-haspopup="menu" aria-expanded={open} onKeyDown={(event) => { if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openMenu() } }} onClick={() => open ? closeMenu() : openMenu()}>{trigger}</button>{open ? <div className="ui-popover ui-dropdown__menu" role="menu" onKeyDown={navigateMenu} onClick={() => { triggerRef.current?.focus({ preventScroll: true }); closeMenu() }}>{children}</div> : null}</div>
 }
 
 export function DropdownItem({ children, onClick }: { children: ReactNode; onClick?: () => void }) {

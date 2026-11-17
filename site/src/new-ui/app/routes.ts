@@ -6,4 +6,4 @@ export type AppRoute = {
   state?: string
 }
 
-export type Navigate = (route: AppRoute) => void
+export type Navigate = (route: AppRoute, options?: { preserveScroll?: boolean; replace?: boolean }) => void

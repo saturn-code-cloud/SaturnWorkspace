@@ -1,7 +1,7 @@
-import { useEffect, useRef, type MouseEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
 import { ChevronLeft, ChevronRight, MoreHorizontal, Search } from 'lucide-react'
-import { IconButton } from './Button'
-import { EmptyState, Skeleton } from './Feedback'
+import { Button, IconButton } from './Button'
+import { EmptyState, Skeleton, type EmptyStateVariant } from './Feedback'
 import { SearchInput, Select } from './FormControls'
 
 export function Card({ children, className = '', padding = 'md' }: { children: ReactNode; className?: string; padding?: 'none' | 'sm' | 'md' | 'lg' }) {
@@ -24,7 +24,7 @@ export function Breadcrumbs({ items, label }: { items: { label: string; onClick?
   return <nav className="ui-breadcrumbs" aria-label={label}>{items.map((item, index) => <span key={`${item.label}-${index}`}>{index ? <ChevronRight size={13} /> : null}{item.onClick ? <button type="button" onClick={item.onClick}>{item.label}</button> : item.label}</span>)}</nav>
 }
 
-export type Column<T> = { key: string; header: string; width?: string; render: (row: T) => ReactNode }
+export type Column<T> = { key: string; header: string; width?: string; narrow?: 'action'; render: (row: T) => ReactNode }
 
 type TableSelection<T> = {
   selectedKeys: ReadonlySet<string>
@@ -41,8 +41,43 @@ function SelectionCheckbox({ checked, indeterminate = false, label, onChange, on
   return <input ref={input} type="checkbox" checked={checked} aria-label={label} onChange={onChange} onClick={onClick} />
 }
 
-export function DataTable<T>({ columns, rows, rowKey, emptyTitle, emptyBody, loading = false, onRowClick, selection }: { columns: Column<T>[]; rows: T[]; rowKey: (row: T) => string; emptyTitle: string; emptyBody: string; loading?: boolean; onRowClick?: (row: T) => void; selection?: TableSelection<T> }) {
-  if (!loading && rows.length === 0) return <EmptyState title={emptyTitle} body={emptyBody} />
+type TableRowAction<T> = { onRowClick?: never; rowAction?: never } | {
+  onRowClick: (row: T) => void
+  rowAction: { header: string; label: string; accessibleLabel: (row: T) => string;
+    disclosure?: { activeKey: string; panelId: string } }
+}
+
+export type DataTableProps<T> = {
+  columns: Column<T>[]; rows: T[]; rowKey: (row: T) => string;
+  emptyTitle: string; emptyBody: string; emptyVariant?: EmptyStateVariant;
+  loading?: boolean; selection?: TableSelection<T>;
+} & TableRowAction<T>
+type ResponsiveTableLayout = { mode: 'stacked' | 'scroll'; scrollHint: string }
+
+function ResponsiveTableFrame({ mode, scrollHint, children }: ResponsiveTableLayout & { children: ReactNode }) {
+  const frame = useRef<HTMLDivElement>(null)
+  const [overflow, setOverflow] = useState(false)
+  useEffect(() => {
+    const root = frame.current
+    const table = root?.querySelector('table')
+    if (!root || !table) return
+    const check = () => setOverflow(root.scrollWidth > root.clientWidth + 1)
+    check()
+    const observer = new ResizeObserver(check)
+    observer.observe(root)
+    observer.observe(table)
+    return () => observer.disconnect()
+  }, [])
+  return <div className="ui-table-responsive">
+    {overflow ? <p className="ui-table-scroll-hint">{scrollHint}</p> : null}
+    <div ref={frame} className={`ui-table-wrap ui-table-wrap--${mode}`}
+      tabIndex={overflow ? 0 : undefined} role={overflow ? 'group' : undefined}
+      aria-label={overflow ? scrollHint : undefined}>{children}</div>
+  </div>
+}
+
+export function DataTable<T>({ columns, rows, rowKey, emptyTitle, emptyBody, emptyVariant = 'page', loading = false, onRowClick, rowAction, selection, responsive }: DataTableProps<T> & { responsive?: ResponsiveTableLayout }) {
+  if (!loading && rows.length === 0) return <EmptyState title={emptyTitle} body={emptyBody} variant={emptyVariant} />
   const pageKeys = rows.map(rowKey)
   const selectedOnPage = pageKeys.filter((key) => selection?.selectedKeys.has(key)).length
   const allOnPageSelected = pageKeys.length > 0 && selectedOnPage === pageKeys.length
@@ -55,26 +90,67 @@ export function DataTable<T>({ columns, rows, rowKey, emptyTitle, emptyBody, loa
     }
     selection.onChange(next)
   }
-  return (
-    <div className="ui-table-wrap">
-      <table className="ui-table">
-        <thead><tr>{selection ? <th className="ui-table__selection"><SelectionCheckbox checked={allOnPageSelected} indeterminate={selectedOnPage > 0 && !allOnPageSelected} label={selection.selectAllLabel} onChange={changePageSelection} /></th> : null}{columns.map((column) => <th key={column.key} style={{ width: column.width }}>{column.header}</th>)}</tr></thead>
-        <tbody>
-          {loading ? Array.from({ length: 5 }, (_, index) => <tr key={index}>{selection ? <td className="ui-table__selection"><Skeleton width="1rem" /></td> : null}{columns.map((column) => <td key={column.key}><Skeleton width={column.width ? '80%' : '65%'} /></td>)}</tr>) : rows.map((row) => (
-            <tr key={rowKey(row)} className={onRowClick ? 'is-clickable' : ''} onClick={() => onRowClick?.(row)}>{selection ? <td className="ui-table__selection"><SelectionCheckbox checked={selection.selectedKeys.has(rowKey(row))} label={selection.rowLabel(row)} onClick={(event) => event.stopPropagation()} onChange={() => { const next = new Set(selection.selectedKeys); const key = rowKey(row); if (next.has(key)) next.delete(key); else next.add(key); selection.onChange(next) }} /></td> : null}{columns.map((column) => <td key={column.key}>{column.render(row)}</td>)}</tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
+  const stacked = responsive?.mode === 'stacked'
+  const table = <table className="ui-table" role={stacked ? 'table' : undefined} aria-busy={loading || undefined}>
+    <thead role={stacked ? 'rowgroup' : undefined}><tr role={stacked ? 'row' : undefined}>
+      {selection ? <th scope="col" className="ui-table__selection" role={stacked ? 'columnheader' : undefined}>
+        {stacked ? <label className="ui-table__select-page">
+          <SelectionCheckbox checked={allOnPageSelected} indeterminate={selectedOnPage > 0 && !allOnPageSelected}
+            label={selection.selectAllLabel} onChange={changePageSelection} />
+          <span className="ui-table__narrow-label" aria-hidden="true">{selection.selectAllLabel}</span>
+        </label> : <SelectionCheckbox checked={allOnPageSelected} indeterminate={selectedOnPage > 0 && !allOnPageSelected}
+          label={selection.selectAllLabel} onChange={changePageSelection} />}
+      </th> : null}
+      {columns.map((column) => <th scope="col" role={stacked ? 'columnheader' : undefined} key={column.key} data-column={column.key} style={{ width: column.width }}>{column.header}</th>)}
+      {rowAction ? <th scope="col" role={stacked ? 'columnheader' : undefined}>{rowAction.header}</th> : null}
+    </tr></thead>
+    <tbody role={stacked ? 'rowgroup' : undefined}>
+      {(loading ? Array.from({ length: 5 }, () => null) : rows).map((row, index) => {
+        const key = row === null ? undefined : rowKey(row)
+        const expanded = key !== undefined && rowAction?.disclosure ? rowAction.disclosure.activeKey === key : undefined
+        return <tr key={key ?? index} data-row-key={key} role={stacked ? 'row' : undefined}
+          data-previewed={expanded || undefined}
+          className={onRowClick && row !== null ? 'is-clickable' : undefined}
+          onClick={onRowClick && row !== null ? (event) => {
+            if (!(event.target as Element).closest('button,a,input,select,textarea,summary')) onRowClick(row)
+          } : undefined}>
+          {selection ? <td role={stacked ? 'cell' : undefined} className="ui-table__selection" data-narrow-cell="selection">
+            {row === null || key === undefined ? <Skeleton width="1rem" /> : <SelectionCheckbox checked={selection.selectedKeys.has(key)}
+              label={selection.rowLabel(row)} onClick={(event) => event.stopPropagation()}
+              onChange={() => {
+                const next = new Set(selection.selectedKeys)
+                if (next.has(key)) next.delete(key); else next.add(key)
+                selection.onChange(next)
+              }} />}
+          </td> : null}
+          {columns.map((column, columnIndex) => {
+            const placement = column.narrow ?? (columnIndex === 0 ? 'identity' : 'field')
+            return <td key={column.key} role={stacked ? 'cell' : undefined} data-column={column.key} data-narrow-cell={stacked ? placement : undefined}>
+              {stacked && placement === 'field' && !loading ? <span className="ui-table__narrow-label" aria-hidden="true">{column.header}</span> : null}
+              {row === null ? <Skeleton width={column.width ? '80%' : '65%'} /> : column.render(row)}
+            </td>
+          })}
+          {rowAction ? <td role={stacked ? 'cell' : undefined} data-narrow-cell="action" className="ui-table__row-action">
+            {row === null ? <Skeleton width="5rem" /> : onRowClick ? <Button size="sm" variant="ghost" aria-label={rowAction.accessibleLabel(row)}
+              aria-expanded={expanded} aria-controls={expanded ? rowAction.disclosure?.panelId : undefined}
+              onClick={() => onRowClick(row)}>{rowAction.label}</Button> : null}
+          </td> : null}
+        </tr>
+      })}
+    </tbody>
+  </table>
+  return responsive ? <ResponsiveTableFrame {...responsive}>{table}</ResponsiveTableFrame> : <div className="ui-table-wrap">{table}</div>
 }
 
 export function TableToolbar({ searchLabel, searchValue, onSearch, filters, action }: { searchLabel: string; searchValue: string; onSearch: (value: string) => void; filters?: ReactNode; action?: ReactNode }) {
   return <div className="ui-table-toolbar"><SearchInput label={searchLabel} placeholder={searchLabel} value={searchValue} onChange={(event) => onSearch(event.target.value)} />{filters}<span className="ui-table-toolbar__spacer" />{action}</div>
 }
 
-export function Pagination({ page, pages, label, previousLabel, nextLabel, onChange }: { page: number; pages: number; label: string; previousLabel: string; nextLabel: string; onChange: (page: number) => void }) {
-  return <div className="ui-pagination"><span>{label}</span><IconButton label={previousLabel} size="sm" disabled={page <= 1} onClick={() => onChange(page - 1)}><ChevronLeft size={15} /></IconButton><strong>{page}</strong><IconButton label={nextLabel} size="sm" disabled={page >= pages} onClick={() => onChange(page + 1)}><ChevronRight size={15} /></IconButton></div>
+type PaginationProps = { page: number; label: string; previousLabel: string; nextLabel: string; disabled?: boolean; onChange: (page: number) => void } &
+  ({ pages: number; hasNext?: never } | { pages?: never; hasNext: boolean })
+
+export function Pagination({ page, pages, hasNext, label, previousLabel, nextLabel, disabled, onChange }: PaginationProps) {
+  return <nav className="ui-pagination" aria-label={label}><span>{label}</span><IconButton label={previousLabel} size="sm" disabled={disabled || page <= 1} onClick={() => onChange(page - 1)}><ChevronLeft size={15} /></IconButton><strong aria-live="polite">{page}</strong><IconButton label={nextLabel} size="sm" disabled={disabled || !(hasNext ?? page < (pages ?? 1))} onClick={() => onChange(page + 1)}><ChevronRight size={15} /></IconButton></nav>
 }
 
 export function ActionMenu({ label, children }: { label: string; children: ReactNode }) {

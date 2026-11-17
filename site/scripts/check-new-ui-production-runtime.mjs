@@ -7,7 +7,6 @@ const sourceFiles = [
   'src/new-ui/app/ProductionApp.tsx',
   'src/new-ui/app/productionRouter.ts',
   'src/new-ui/adapters/productionAdapters.ts',
-  'src/new-ui/pages/production/ProductionPages.tsx',
   'src/new-ui/layouts/SharedChrome.tsx',
   'src/new-ui/layouts/WorkspaceShell.tsx',
 ]
@@ -40,7 +39,11 @@ function walk(dir) {
 
 const checked = []
 const failures = []
-for (const rel of sourceFiles) {
+const productionPages = 'src/new-ui/pages/production'
+const productionPageFiles = readdirSync(join(root, productionPages), { withFileTypes: true })
+  .filter((entry) => entry.isFile() && /\.tsx?$/.test(entry.name))
+  .map((entry) => `${productionPages}/${entry.name}`)
+for (const rel of [...sourceFiles, ...productionPageFiles]) {
   const file = join(root, rel)
   if (!existsSync(file)) {
     failures.push(`missing:${rel}`)

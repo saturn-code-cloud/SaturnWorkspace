@@ -32,8 +32,10 @@ export function InlineError({ message }: { message: string }) {
   return <span className="ui-inline-state ui-inline-state--error"><AlertCircle size={16} />{message}</span>
 }
 
-export function EmptyState({ icon: Icon = Info, title, body, action }: { icon?: LucideIcon; title: string; body: string; action?: ReactNode }) {
-  return <div className="ui-empty"><span className="ui-empty__icon"><Icon size={22} /></span><h3>{title}</h3><p>{body}</p>{action}</div>
+export type EmptyStateVariant = 'page' | 'section'
+
+export function EmptyState({ icon: Icon = Info, title, body, action, variant = 'page' }: { icon?: LucideIcon; title: string; body: string; action?: ReactNode; variant?: EmptyStateVariant }) {
+  return <div className={`ui-empty ui-empty--${variant}`}>{variant === 'page' ? <span className="ui-empty__icon"><Icon size={22} aria-hidden="true" /></span> : null}<h3>{title}</h3>{body ? <p>{body}</p> : null}{action}</div>
 }
 
 export function Skeleton({ width = '100%', height = 14 }: { width?: string; height?: number }) {

@@ -1,77 +1,38 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import {
-  ArrowLeft,
-  ArrowRight,
-  Archive,
-  Bell,
-  Bug,
-  Check,
-  CheckCheck,
-  Copy,
-  CreditCard,
-  Download,
-  KeyRound,
-  LayoutDashboard,
-  LifeBuoy,
-  Mail,
-  Monitor,
-  PackageOpen,
-  Paperclip,
-  ReceiptText,
-  RefreshCcw,
-  ScrollText,
-  Send,
-  Settings,
-  ShieldAlert,
-  ShieldCheck,
-  Tags,
-  Users,
-  WalletCards,
-} from 'lucide-react'
-import type { AdminCommerceOverview, AdminEmailCatalogItem, AdminEmailJob, AdminEmailProviderEvent, AdminEmailRecipientFlag, AdminEmailStatus, AdminInboundEmailMessage, AdminPromoCode, AdminScheduledEmail, AdminSupportThread, ManualGrantPreview } from '../../../api/admin'
+import { ArrowLeft, ArrowRight, Archive, Bell, Check, CheckCheck, CreditCard, Download, KeyRound, LayoutDashboard, LifeBuoy, Mail, Monitor, ReceiptText, Settings, ShieldAlert, ShieldCheck, WalletCards } from 'lucide-react'
 import type { AccountDeletionStatusResult, AccountSession, AccountSubscription } from '../../../api/account'
 import { useAdapters } from '../../adapters/AdapterProvider'
-import type { AccountNotification, CustomerSupportThread, PlanInfo, ReleaseInfo, SupportSenderRole } from '../../adapters/contracts'
+import type { AccountNotification, CustomerSupportThread, PlanInfo, ReleaseInfo } from '../../adapters/contracts'
 import { useExperience } from '../../app/ExperienceProvider'
+import { activationFromQuery, clearActivationPayload, readActivationPayload, rememberActivationPayload, type ActivationPayload } from '../../app/desktopActivation'
 import { createAuthRoute, createPricingReturnState, currentInternalLocation, readAuthIntent, readCheckoutPlan } from '../../app/navigationIntent'
 import { routeFromInternalUrl } from '../../app/productionRouter'
 import { Button } from '../../components/ui/Button'
 import { CheckoutDialog } from '../../components/CheckoutDialog'
 import { GoogleIcon } from '../../components/icons/GoogleIcon'
-import { Card, DataTable, PageHeader, SectionHeader, StatCard, TableToolbar, type Column } from '../../components/ui/DataDisplay'
+import { Card, DataTable, PageHeader, SectionHeader, TableToolbar, type Column } from '../../components/ui/DataDisplay'
 import { Alert, Badge, CardSkeleton, EmptyState, FullPageState, Skeleton, SkeletonStack } from '../../components/ui/Feedback'
 import { Checkbox, FormField, Input, OTPInput, PasswordInput, Select, Textarea } from '../../components/ui/FormControls'
-import { Accordion, Tabs } from '../../components/ui/Navigation'
-import { ConfirmDialog, Drawer, Modal } from '../../components/ui/Overlays'
+import { Accordion } from '../../components/ui/Navigation'
+import { ConfirmDialog, Drawer } from '../../components/ui/Overlays'
 import { DownloadCard, PricingCard, SubscriptionCard } from '../../components/ui/ProductCards'
 import { publicCopy } from '../../content/publicCopy'
 import { CURRENT_TERMS_VERSION } from '../../content/legalContent'
 import { isProductionFeatureEnabled } from '../../adapters/productionFeatureFlags'
-import { compareReleaseVersions } from '../../../lib/releaseContract'
 import { PublicLayout, WorkspaceShell, type NavigationGroup } from '../../layouts/WorkspaceShell'
 import { Brand, LocaleControl, ThemeControl } from '../../layouts/SharedChrome'
 import appIcon from '../../assets/saturnws-app-icon.png'
 import type { Navigate } from '../../app/routes'
 import type { MessageKey } from '../../i18n/messages'
 import { useAuthState } from '../../hooks/useAuthState'
-import {
-  AdminAudit,
-  AdminDiagnostics,
-  AdminOverview,
-  AdminPolicies,
-  AdminReadiness,
-  AdminSettings,
-  AdminSubscriptions,
-  AdminUsers,
-} from './AdminOperations'
-
-type ResourceStatus = 'idle' | 'bootstrapping' | 'loading_initial' | 'refreshing' | 'success' | 'empty' | 'partial' | 'error_recoverable' | 'error_terminal'
-type AsyncResource<T> = { status: ResourceStatus; loading: boolean; refreshing: boolean; data: T | null; error: string | null; reload: () => void }
+import { useAsyncData } from '../../hooks/useAsyncData'
+import { copyByLocale, formatBytes, formatDisplayDate } from './productionPresentation'
+import { ErrorBlock } from './ProductionErrorBlock'
+import { stableTicketNumber, supportErrorMessage, supportSenderRole, supportStatusLabel, supportStatusTone } from './productionSupport'
+import { SupportThreadMessage } from './ProductionSupportMessage'
 const PENDING_EMAIL_VERIFICATION_KEY = 'saturnws.production.pendingEmailVerification.v1'
 const SIGNUP_PREFILL_KEY = 'saturnws.production.signupPrefill.v1'
-const ACTIVATION_STORAGE_KEY = 'saturnws.activation.payload.v1'
 const AUTH_BASE = 'https://auth.saturnws.com'
-const EMAIL_SUPPORT_ENABLED = true
 
 type PendingEmailVerificationContext = {
   kind: 'registration' | 'account'
@@ -94,11 +55,6 @@ type SignupPrefill = {
   termsAccepted?: boolean
 }
 
-type ActivationPayload = {
-  ticket: string
-  legacyCode?: string
-}
-
 type DeviceActivationFailurePayload = {
   error: string
   device_code?: string
@@ -118,9 +74,6 @@ class DeviceActivationError extends Error {
   }
 }
 
-function copyByLocale(locale: 'ar' | 'en', en: string, ar: string) {
-  return locale === 'ar' ? ar : en
-}
 
 function emailRequiredMessage(locale: 'ar' | 'en') {
   return copyByLocale(locale, 'Enter your email address.', 'اكتب البريد الإلكتروني.')
@@ -221,41 +174,6 @@ function clearSignupPrefill() {
   window.sessionStorage.removeItem(SIGNUP_PREFILL_KEY)
 }
 
-function loadActivationPayload(routeState?: string): ActivationPayload | null {
-  if (typeof window === 'undefined') return null
-  const params = new URLSearchParams(routeState?.startsWith('?') ? routeState.slice(1) : routeState || window.location.search.slice(1))
-  const ticket = String(params.get('ticket') || params.get('device_code') || '').trim()
-  const legacyCode = String(params.get('code') || '').trim().toUpperCase()
-  if (ticket || legacyCode) {
-    const payload = { ticket, legacyCode: legacyCode || undefined }
-    window.sessionStorage.setItem(ACTIVATION_STORAGE_KEY, JSON.stringify(payload))
-    if (window.location.pathname === '/activate') {
-      params.delete('ticket')
-      params.delete('device_code')
-      params.delete('code')
-      const next = params.toString()
-      window.history.replaceState({}, document.title, `/account/signin${next ? `?${next}` : ''}${window.location.hash}`)
-    }
-    return payload
-  }
-  try {
-    const raw = window.sessionStorage.getItem(ACTIVATION_STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as Partial<ActivationPayload>
-    const storedTicket = String(parsed.ticket || '').trim()
-    const storedLegacyCode = String(parsed.legacyCode || '').trim().toUpperCase()
-    if (!storedTicket && !storedLegacyCode) return null
-    return { ticket: storedTicket, legacyCode: storedLegacyCode || undefined }
-  } catch {
-    return null
-  }
-}
-
-function clearActivationPayload() {
-  if (typeof window === 'undefined') return
-  window.sessionStorage.removeItem(ACTIVATION_STORAGE_KEY)
-}
-
 async function completeDeviceActivation(idToken: string, activation: ActivationPayload) {
   const response = await fetch(`${AUTH_BASE}/device/complete`, {
     method: 'POST',
@@ -304,101 +222,13 @@ async function completeDeviceActivationWithCurrentToken(
   }
 }
 
-function stableTicketNumber(id: string, createdAt?: string | null, updatedAt?: string | null) {
-  const year = (createdAt || updatedAt || new Date().toISOString()).slice(0, 4).replace(/\D/g, '') || '2026'
-  let hash = 0
-  for (const char of id) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
-  return `SAT-${year}-${String(hash % 1000000).padStart(6, '0')}`
-}
 
-function supportStatusTone(status?: string) {
-  const normalized = String(status || 'open').toLowerCase()
-  if (normalized === 'closed' || normalized === 'blocked') return 'neutral' as const
-  if (normalized === 'resolved') return 'success' as const
-  if (normalized === 'waiting_for_customer' || normalized === 'awaiting_customer' || normalized === 'answered') return 'warning' as const
-  return 'info' as const
-}
 
-function supportStatusLabel(status: string | undefined, locale: 'ar' | 'en') {
-  const normalized = String(status || 'open').toLowerCase()
-  const labels: Record<string, { en: string; ar: string }> = {
-    open: { en: 'Open', ar: 'مفتوحة' },
-    waiting_for_support: { en: 'Waiting for support', ar: 'بانتظار الدعم' },
-    awaiting_support: { en: 'Waiting for support', ar: 'بانتظار الدعم' },
-    waiting_for_customer: { en: 'Waiting for customer', ar: 'بانتظار العميل' },
-    awaiting_customer: { en: 'Waiting for customer', ar: 'بانتظار العميل' },
-    answered: { en: 'Waiting for customer', ar: 'بانتظار العميل' },
-    resolved: { en: 'Resolved', ar: 'تم الحل' },
-    closed: { en: 'Closed', ar: 'مغلقة' },
-    reopened: { en: 'Reopened', ar: 'أعيد فتحها' },
-    blocked: { en: 'Blocked', ar: 'محظورة' },
-  }
-  const item = labels[normalized] || labels.open
-  return locale === 'ar' ? item.ar : item.en
-}
 
-function supportSenderRole(sender: string | undefined, explicitRole?: SupportSenderRole): SupportSenderRole {
-  if (explicitRole) return explicitRole
-  const normalized = String(sender || '').trim().toLowerCase()
-  if (normalized === 'admin' || normalized === 'support' || normalized === 'support_agent' || normalized === 'agent') return 'support_agent'
-  if (normalized === 'internal' || normalized === 'internal_note') return 'internal_note'
-  if (normalized === 'system') return 'system'
-  if (normalized === 'email_inbound') return 'email_inbound'
-  return 'customer'
-}
 
-function supportSenderLabel(role: SupportSenderRole, locale: 'ar' | 'en') {
-  if (role === 'support_agent') return copyByLocale(locale, 'Support', 'الدعم')
-  if (role === 'internal_note') return copyByLocale(locale, 'Internal note', 'ملاحظة داخلية')
-  if (role === 'system') return copyByLocale(locale, 'System', 'النظام')
-  if (role === 'email_inbound') return copyByLocale(locale, 'Customer by email', 'العميل عبر البريد')
-  return copyByLocale(locale, 'Customer', 'العميل')
-}
 
-function supportMessageClass(role: SupportSenderRole) {
-  return `support-message support-message--${role}`
-}
 
-function supportAuditLabel(eventType: string, locale: 'ar' | 'en') {
-  const labels: Record<string, { en: string; ar: string }> = {
-    ticket_created: { en: 'Ticket created', ar: 'إنشاء التذكرة' },
-    customer_reply: { en: 'Customer replied', ar: 'رد العميل' },
-    support_reply: { en: 'Support replied', ar: 'رد الدعم' },
-    internal_note_added: { en: 'Internal note added', ar: 'إضافة ملاحظة داخلية' },
-    status_changed: { en: 'Status changed', ar: 'تغيير الحالة' },
-    priority_changed: { en: 'Priority changed', ar: 'تغيير الأولوية' },
-    ticket_closed: { en: 'Ticket closed', ar: 'إغلاق التذكرة' },
-    ticket_reopened: { en: 'Ticket reopened', ar: 'إعادة فتح التذكرة' },
-    sender_blocked: { en: 'Sender blocked', ar: 'حظر المرسل' },
-    sender_unblocked: { en: 'Sender unblocked', ar: 'إلغاء حظر المرسل' },
-    inbound_email_processed: { en: 'Email reply received', ar: 'استلام رد عبر البريد' },
-    email_delivery_failed: { en: 'Email delivery failed', ar: 'فشل تسليم البريد' },
-    email_delivery_retry_scheduled: { en: 'Email retry scheduled', ar: 'جدولة إعادة إرسال البريد' },
-    email_retry_requested: { en: 'Email retry requested', ar: 'طلب إعادة إرسال البريد' },
-  }
-  const item = labels[eventType] || { en: 'Support activity', ar: 'نشاط دعم' }
-  return locale === 'ar' ? item.ar : item.en
-}
 
-function supportErrorMessage(error: unknown, locale: 'ar' | 'en') {
-  const raw = String(error instanceof Error ? error.message : error || '').trim()
-  const key = raw.toLowerCase()
-  if (key === 'auth_session_expired' || key === 'not_authenticated' || key === 'missing_id_token' || key === 'unauthorized') {
-    return copyByLocale(locale, 'Your session expired. Sign in again and retry.', 'انتهت جلسة تسجيل الدخول. سجّل الدخول مرة أخرى ثم أعد المحاولة.')
-  }
-  if (key === 'support_ticket_forbidden' || key === 'thread_not_found') {
-    return copyByLocale(locale, 'This ticket is unavailable or no longer belongs to this account.', 'هذه التذكرة غير متاحة أو لم تعد مرتبطة بهذا الحساب.')
-  }
-  if (key === 'support_rate_limited') {
-    return copyByLocale(locale, 'Daily support message limit reached. Try again later.', 'تم الوصول إلى الحد اليومي لرسائل الدعم. حاول لاحقًا.')
-  }
-  if (key === 'support_blocked') return copyByLocale(locale, 'Support messaging is unavailable for this account.', 'إرسال رسائل الدعم غير متاح لهذا الحساب.')
-  if (key === 'ticket_closed') return copyByLocale(locale, 'Reopen the ticket before sending another reply.', 'أعد فتح التذكرة قبل إرسال رد جديد.')
-  if (key === 'network_unavailable' || key.includes('failed to fetch') || key.includes('network')) {
-    return copyByLocale(locale, 'Unable to reach the server right now. Check the connection and retry.', 'تعذر الوصول إلى الخادم حاليًا. تحقق من الاتصال ثم أعد المحاولة.')
-  }
-  return copyByLocale(locale, 'The request could not be completed. Try again.', 'تعذر تنفيذ الطلب. حاول مرة أخرى.')
-}
 
 function deviceActivationErrorMessage(error: unknown, locale: 'ar' | 'en') {
   const raw = String(error instanceof Error ? error.message : error || '').trim()
@@ -433,94 +263,10 @@ function deviceActivationErrorMessage(error: unknown, locale: 'ar' | 'en') {
   return copyByLocale(locale, 'The desktop app could not be linked to this account. Try again from the desktop app.', 'تعذر ربط أداة سطح المكتب بهذا الحساب. حاول مرة أخرى من الأداة.')
 }
 
-function emailJobTone(status?: string) {
-  const normalized = String(status || '').toLowerCase()
-  if (normalized === 'sent' || normalized === 'delivered') return 'success' as const
-  if (normalized === 'pending' || normalized === 'queued' || normalized === 'scheduled') return 'info' as const
-  if (normalized === 'retrying') return 'warning' as const
-  if (normalized === 'failed' || normalized === 'bounced' || normalized === 'complained' || normalized === 'suppressed') return 'danger' as const
-  return 'neutral' as const
-}
 
-function emailIntegrationTone(status?: string) {
-  const normalized = String(status || '').toLowerCase()
-  if (normalized === 'linked') return 'success' as const
-  if (normalized === 'prepared') return 'info' as const
-  if (normalized === 'disabled') return 'warning' as const
-  return 'danger' as const
-}
 
-function boolLabel(value: unknown, locale: 'ar' | 'en') {
-  return value ? copyByLocale(locale, 'On', 'مفعّل') : copyByLocale(locale, 'Off', 'متوقف')
-}
 
-function formatBytes(bytes?: number) {
-  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return ''
-  const units = ['B', 'KB', 'MB', 'GB']
-  let value = bytes
-  let index = 0
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024
-    index += 1
-  }
-  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`
-}
 
-function formatDisplayDate(value?: string | null, locale: 'ar' | 'en' = 'ar') {
-  const raw = String(value || '').trim()
-  if (!raw) return '—'
-  const date = new Date(raw)
-  if (Number.isNaN(date.getTime())) return '—'
-  return new Intl.DateTimeFormat(locale === 'ar' ? 'ar-EG' : 'en-US', {
-    year: 'numeric',
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(date)
-}
-
-function isEmptyAsyncData<T>(data: T | null): boolean {
-  if (data == null) return true
-  if (Array.isArray(data)) return data.length === 0
-  return false
-}
-
-function useAsyncData<T>(load: () => Promise<T>, deps: React.DependencyList): AsyncResource<T> {
-  const [version, setVersion] = useState(0)
-  const [state, setState] = useState<Omit<AsyncResource<T>, 'reload'>>({ status: 'idle', loading: true, refreshing: false, data: null, error: null })
-  useEffect(() => {
-    let alive = true
-    Promise.resolve()
-      .then(() => {
-        if (alive) setState((previous) => ({
-          ...previous,
-          status: previous.data ? 'refreshing' : 'loading_initial',
-          loading: !previous.data,
-          refreshing: Boolean(previous.data),
-          error: null,
-        }))
-      })
-      .then(load)
-      .then((data) => {
-        if (alive) setState({ status: isEmptyAsyncData(data) ? 'empty' : 'success', loading: false, refreshing: false, data, error: null })
-      })
-      .catch((error) => {
-        if (alive) setState((previous) => ({
-          status: previous.data ? 'partial' : 'error_recoverable',
-          loading: false,
-          refreshing: false,
-          data: previous.data,
-          error: error instanceof Error ? error.message : 'request_failed',
-        }))
-      })
-    return () => {
-      alive = false
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, version])
-  return { ...state, reload: () => setVersion((value) => value + 1) }
-}
 
 function LoadingBlock({ label }: { label: string }) {
   void label
@@ -567,40 +313,10 @@ function PortalSettingsSkeleton() {
   return <><PageHeaderSkeleton /><div className="settings-sections"><Card><SectionHeaderSkeleton /><div className="settings-form"><Skeleton width="100%" height={44} /><Skeleton width="100%" height={44} /><Skeleton width="140px" height={40} /></div></Card><Card><SectionHeaderSkeleton /><Skeleton width="180px" height={40} /></Card></div></>
 }
 
-function AdminOverviewSkeleton() {
-  return <><PageHeaderSkeleton /><div className="admin-metric-strip">{Array.from({ length: 4 }).map((_, index) => <StatCard key={index} label={<Skeleton width="90px" height={12} />} value={<Skeleton width="52px" height={27} />} />)}</div><Card><SectionHeaderSkeleton /><SkeletonStack rows={5} /></Card></>
-}
 
-function AdminSubscriptionsSkeleton() {
-  return <><PageHeaderSkeleton actions /><div className="ui-table-toolbar"><Skeleton width="280px" height={38} /></div><TablePanelSkeleton columns={5} rows={6} /></>
-}
 
-function AdminEmailOperationsSkeleton() {
-  return <><PageHeaderSkeleton actions /><div className="admin-metric-strip">{Array.from({ length: 10 }).map((_, index) => <StatCard key={index} label={<Skeleton width="86px" height={12} />} value={<Skeleton width="44px" height={24} />} />)}</div><div className="admin-overview-grid"><Card><SectionHeaderSkeleton /><SkeletonStack rows={4} /></Card><Card><SectionHeaderSkeleton /><div className="cluster"><Skeleton width="86px" height={22} /><Skeleton width="96px" height={22} /><Skeleton width="84px" height={22} /></div></Card></div><Card><SectionHeaderSkeleton /><div className="settings-form"><div className="form-grid"><Skeleton width="100%" height={44} /><Skeleton width="100%" height={44} /><Skeleton width="100%" height={44} /></div><div className="cluster"><Skeleton width="120px" height={40} /><Skeleton width="140px" height={40} /></div></div></Card><div className="admin-tab-panel"><TablePanelSkeleton columns={5} rows={5} /></div></>
-}
 
-function userFacingErrorMessage(error: string, locale: 'ar' | 'en') {
-  const key = String(error || '').trim().toLowerCase()
-  if (key === 'invalid_file_type' || key === 'invalid_file_content') {
-    return copyByLocale(locale, 'Choose a valid update file for the selected type.', 'اختر ملف تحديث صالحًا للنوع المحدد.')
-  }
-  if (key === 'file_too_large') {
-    return copyByLocale(locale, 'The update file exceeds the allowed size.', 'حجم ملف التحديث أكبر من الحد المسموح.')
-  }
-  if (key === 'origin_not_allowed' || key === 'forbidden_origin') {
-    return copyByLocale(
-      locale,
-      'This request was blocked by the site origin policy. Open the admin panel from admin.saturnws.com and retry.',
-      'تم حظر الطلب بسبب سياسة مصدر الموقع. افتح لوحة الإدارة من admin.saturnws.com ثم أعد المحاولة.',
-    )
-  }
-  return error
-}
 
-function ErrorBlock({ error, onRetry }: { error: string; onRetry?: () => void }) {
-  const { t, locale } = useExperience()
-  return <Alert title={t('failed')} tone="danger" action={onRetry ? <Button size="sm" onClick={onRetry}>{t('retry')}</Button> : undefined}>{userFacingErrorMessage(error, locale)}</Alert>
-}
 
 function authErrorMessage(error: unknown, t: (key: MessageKey) => string, locale: 'ar' | 'en') {
   const raw = error instanceof Error ? error.message : String(error || '')
@@ -811,7 +527,11 @@ function EmailPasswordProductionPage({ page, routeState, navigate }: { page: str
   const [deviceChangeReason, setDeviceChangeReason] = useState('')
   const [deviceChangeSubmitted, setDeviceChangeSubmitted] = useState(false)
   const signup = page === 'signup'
-  const activationPayload = useMemo(() => loadActivationPayload(routeState), [routeState])
+  const activationPayload = useMemo(() => readActivationPayload(routeState), [routeState])
+  useEffect(() => {
+    const incoming = activationFromQuery(routeState)
+    if (incoming) rememberActivationPayload(incoming)
+  }, [routeState])
   const completionStartedRef = useRef(false)
   const captureActivationError = useCallback((err: unknown) => {
     if (err instanceof DeviceActivationError && err.payload.error === 'device_change_required') {
@@ -1185,11 +905,6 @@ function SubscriptionSummary({ data, loading, navigate }: { data: AccountSubscri
   return <SubscriptionCard title={t('subscriptionStatus')} status={sub?.plan || sub?.tier || projection?.plan_term || t('active')} tone={projection?.entitlement === 'payment_required' ? 'warning' : 'success'} badgeLabel={projection?.entitlement || sub?.status || t('active')} details={[{ label: t('email'), value: data?.user?.email || sub?.user_email || '—' }, { label: t('plan'), value: sub?.plan || sub?.tier || projection?.plan_term || t('planUnavailable') }, { label: t('expiresOn'), value: formatDisplayDate(sub?.expires_at || projection?.expires_at, locale) }, { label: t('status'), value: projection?.lifecycle || sub?.status || data?.status || '—' }]} />
 }
 
-function SupportThreadMessage({ message, locale, onAttachmentDownload }: { message: { id: string; sender?: string; senderRole?: SupportSenderRole; sender_role?: SupportSenderRole | string | null; body?: string; createdAt?: string; created_at?: string; attachments?: Array<{ id: string; filename: string; mimeType?: string; mime_type?: string; sizeBytes?: number; size_bytes?: number; status?: string }> }; locale: 'ar' | 'en'; onAttachmentDownload?: (attachment: { id: string; filename: string }) => Promise<void> }) {
-  const { support, admin } = useAdapters()
-  const role = supportSenderRole(message.sender, (message.senderRole || message.sender_role || undefined) as SupportSenderRole | undefined)
-  return <article className={supportMessageClass(role)} data-role={role}><strong>{supportSenderLabel(role, locale)}</strong>{role === 'system' ? <span>{message.body}</span> : <p>{message.body}</p>}{message.attachments?.length ? <div className="support-attachments">{message.attachments.map((attachment) => <Button key={attachment.id} size="sm" variant="secondary" leadingIcon={<Paperclip size={14} />} onClick={() => { void (onAttachmentDownload ? onAttachmentDownload(attachment) : message.created_at ? admin.downloadSupportAttachment(attachment) : support.downloadAttachment({ id: attachment.id, filename: attachment.filename, mimeType: attachment.mimeType || attachment.mime_type || 'application/octet-stream', sizeBytes: attachment.sizeBytes || attachment.size_bytes || 0, status: attachment.status || 'complete' })) }}>{attachment.filename}</Button>)}</div> : null}<small>{formatDisplayDate(message.createdAt || message.created_at, locale)}</small></article>
-}
 
 function PortalSubscription() {
   const { t } = useExperience()
@@ -1446,7 +1161,7 @@ function PortalSupport() {
         <Card>
           <SectionHeader title={t('recentSupport')} />
           <TableToolbar searchLabel={t('search')} searchValue={search} onSearch={setSearch} filters={<Select aria-label={t('status')} value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">{t('status')}</option><option value="open">{supportStatusLabel('open', locale)}</option><option value="awaiting_support">{supportStatusLabel('awaiting_support', locale)}</option><option value="awaiting_customer">{supportStatusLabel('awaiting_customer', locale)}</option><option value="reopened">{supportStatusLabel('reopened', locale)}</option><option value="closed">{supportStatusLabel('closed', locale)}</option><option value="blocked">{supportStatusLabel('blocked', locale)}</option></Select>} />
-          {threads.error ? <ErrorBlock error={supportErrorMessage(threads.error, locale)} onRetry={threads.reload} /> : <DataTable columns={columns} rows={visibleThreads} loading={threads.loading} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'Create a ticket when you need help.', 'أنشئ تذكرة عندما تحتاج إلى مساعدة.')} onRowClick={(row) => { setSelected(row); setError(''); setNotice('') }} />}
+          {threads.error ? <ErrorBlock error={supportErrorMessage(threads.error, locale)} onRetry={threads.reload} /> : <DataTable columns={columns} rows={visibleThreads} loading={threads.loading} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'Create a ticket when you need help.', 'أنشئ تذكرة عندما تحتاج إلى مساعدة.')} onRowClick={(row) => { setSelected(row); setError(''); setNotice('') }} rowAction={{ header: t('actions'), label: t('open'), accessibleLabel: (row) => copyByLocale(locale, `Open ticket ${row.subject}`, `فتح تذكرة ${row.subject}`) }} />}
         </Card>
       </div>
       {error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}
@@ -1536,585 +1251,11 @@ function PortalSettings() {
   return <><PageHeader title={t('settings')} /><div className="settings-sections"><Card><SectionHeader title={t('profile')} /><form className="settings-form" onSubmit={async (event) => { event.preventDefault(); const next = await account.updateProfile({ displayName: name }); setName(next.displayName || ''); setMessage(t('success')) }}><FormField label={t('name')} htmlFor="profile-name"><Input id="profile-name" value={name} onChange={(event) => setName(event.target.value)} /></FormField><FormField label={t('email')} htmlFor="profile-email"><Input id="profile-email" value={user?.email || ''} readOnly /></FormField><Button variant="primary">{t('save')}</Button>{message ? <Alert title={message} tone="success" /> : null}</form></Card><Card><SectionHeader title={t('security')} /><Button onClick={async () => { await account.sendPasswordReset(); setMessage(t('passwordUpdated')) }}>{t('forgotPassword')}</Button></Card><Card><SectionHeader title={t('deleteAccount')} description={copyByLocale(locale, 'Request cancellation first. Final irreversible deletion is not available without a separate destructive approval.', 'ابدأ بطلب الحذف فقط. الحذف النهائي غير القابل للتراجع غير متاح بدون موافقة مدمّرة مستقلة.')} />{deletionLoading ? <SkeletonStack rows={3} /> : deletionUnavailable ? <Alert title={copyByLocale(locale, 'Account deletion is not available yet.', 'حذف الحساب غير متاح حاليًا.')} tone="warning">{copyByLocale(locale, 'The deletion request system is prepared but still waiting for its production database migration.', 'نظام طلبات الحذف جاهز في الواجهة لكنه بانتظار ترحيل قاعدة البيانات الإنتاجية.')}</Alert> : pendingDeletion ? <div className="stack"><Alert title={copyByLocale(locale, 'Deletion request pending', 'طلب الحذف قيد الانتظار')} tone={deletionState === 'on_hold' ? 'warning' : 'danger'}>{copyByLocale(locale, 'The account is marked pending deletion. You can cancel the request before final processing.', 'الحساب معلّم كطلب حذف قيد الانتظار. يمكنك إلغاء الطلب قبل المعالجة النهائية.')}</Alert><dl className="detail-list"><div><dt>{copyByLocale(locale, 'Requested', 'تاريخ الطلب')}</dt><dd>{formatDisplayDate(deletion?.request?.requested_at, locale)}</dd></div><div><dt>{copyByLocale(locale, 'Cooling-off ends', 'نهاية مهلة التراجع')}</dt><dd>{formatDisplayDate(deletion?.request?.cooling_off_until, locale)}</dd></div><div><dt>{copyByLocale(locale, 'Final purge', 'الحذف النهائي')}</dt><dd>{copyByLocale(locale, 'Disabled until explicit destructive approval.', 'معطّل حتى موافقة مدمّرة صريحة.')}</dd></div></dl><Button variant="secondary" loading={deletionBusy} onClick={() => void cancelDeletion()}>{copyByLocale(locale, 'Cancel deletion request', 'إلغاء طلب الحذف')}</Button></div> : <div className="stack"><FormField label={copyByLocale(locale, 'Reason (optional)', 'السبب (اختياري)')} htmlFor="deletion-reason"><Textarea id="deletion-reason" value={deletionReason} maxLength={500} onChange={(event) => setDeletionReason(event.target.value)} /></FormField><Button variant="danger" loading={deletionBusy} onClick={() => void requestDeletion()}>{t('deleteAccount')}</Button><Alert title={copyByLocale(locale, 'No immediate deletion', 'لا يوجد حذف فوري')} tone="info">{copyByLocale(locale, 'This creates a cancellable request and signs out linked desktop sessions. It does not purge user data.', 'هذا ينشئ طلبًا قابلًا للإلغاء وينهي جلسات سطح المكتب المرتبطة. لا يحذف بيانات المستخدم نهائيًا.')}</Alert></div>}{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}</Card></div></>
 }
 
-export function AdminProductionPages({ page, navigate }: { page: string; navigate: Navigate }) {
-  const { t, locale } = useExperience()
-  const groups = useMemo<NavigationGroup[]>(() => [
-    { items: [{ id: 'overview', label: t('overview'), icon: LayoutDashboard }] },
-    { label: t('users'), items: [{ id: 'users', label: t('users'), icon: Users }, { id: 'subscriptions', label: t('subscriptions'), icon: CreditCard }, { id: 'commerce', label: t('payments'), icon: WalletCards }] },
-    { label: t('distribution'), items: [{ id: 'releases', label: t('releases'), icon: PackageOpen }, { id: 'promos', label: t('promoCodes'), icon: Tags }] },
-    { label: t('operations'), items: [{ id: 'support', label: t('supportInbox'), icon: LifeBuoy }, { id: 'communications', label: copyByLocale(locale, 'Email Operations', 'عمليات البريد'), icon: Mail }, { id: 'diagnostics', label: t('diagnostics'), icon: Bug }] },
-    { label: t('governance'), items: [{ id: 'policies', label: t('policies'), icon: ShieldCheck }, { id: 'audit', label: t('auditLog'), icon: ScrollText }, { id: 'readiness', label: copyByLocale(locale, 'Readiness', 'الجاهزية'), icon: CheckCheck }, { id: 'settings', label: t('settings'), icon: Settings }] },
-  ], [t, locale])
-  const title = groups.flatMap((group) => group.items).find((item) => item.id === page)?.label || t('adminOverview')
-  return <AdminGuard navigate={navigate}><WorkspaceShell surface="admin" page={page} title={title} groups={groups} navigate={navigate} admin>{page === 'users' ? <AdminUsers /> : page === 'subscriptions' ? <AdminSubscriptions /> : page === 'releases' ? <AdminReleases /> : page === 'support' ? <AdminSupportV2 /> : page === 'communications' ? <AdminEmailOperations /> : page === 'diagnostics' ? <AdminDiagnostics /> : page === 'audit' ? <AdminAudit /> : page === 'promos' ? <AdminPromos /> : page === 'commerce' ? <AdminCommerce /> : page === 'policies' ? <AdminPolicies /> : page === 'readiness' ? <AdminReadiness /> : page === 'settings' ? <AdminSettings /> : <AdminOverview />}</WorkspaceShell></AdminGuard>
-}
 
-function AdminGuard({ children }: { children: ReactNode; navigate: Navigate }) {
-  const { t, locale } = useExperience()
-  const { admin } = useAdapters()
-  const [checked, setChecked] = useState(false)
-  const [preauth, setPreauth] = useState(false)
-  const [sessionEmail, setSessionEmail] = useState('')
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState('')
-  useEffect(() => {
-    let alive = true
-    Promise.allSettled([admin.getPreauthState(), admin.getSession()])
-      .then(([preauthResult, sessionResult]) => {
-        if (!alive) return
-        if (preauthResult.status === 'fulfilled') setPreauth(preauthResult.value.authenticated)
-        if (sessionResult.status === 'fulfilled') setSessionEmail(sessionResult.value.email)
-        setChecked(true)
-      })
-      .catch(() => {
-        if (alive) setChecked(true)
-      })
-    return () => {
-      alive = false
-    }
-  }, [admin])
-  if (!checked) return <FullPageState icon={ShieldCheck} title={t('loading')} body={copyByLocale(locale, 'Checking admin access.', 'جار التحقق من صلاحية الإدارة.')} />
-  if (!preauth) return <main className="admin-login"><header><Brand /><div className="cluster"><LocaleControl /><ThemeControl /></div></header><Card className="admin-login__card"><h1>{t('adminConsole')}</h1><p>{copyByLocale(locale, 'Use an authorized admin account.', 'استخدم حساب إدارة مخولًا.')}</p><form className="stack" onSubmit={async (event) => { event.preventDefault(); setError(''); try { const result = await admin.submitPreauth({ username, password }); setPreauth(result.authenticated); if (!result.authenticated) setError('admin_preauth_failed') } catch (err) { setError(err instanceof Error ? err.message : 'admin_preauth_failed') } }}><FormField label={t('email')} htmlFor="admin-user"><Input id="admin-user" value={username} onChange={(event) => setUsername(event.target.value)} /></FormField><FormField label={t('password')} htmlFor="admin-pass"><PasswordInput id="admin-pass" value={password} onChange={(event) => setPassword(event.target.value)} /></FormField>{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}<Button variant="primary" fullWidth>{t('continue')}</Button></form></Card></main>
-  if (!sessionEmail) return <main className="admin-login"><header><Brand /><div className="cluster"><LocaleControl /><ThemeControl /></div></header><Card className="admin-login__card"><h1>{t('adminConsole')}</h1><p>{copyByLocale(locale, 'Continue with your admin Google account.', 'تابع باستخدام حساب Google الإداري.')}</p>{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}<Button variant="primary" fullWidth onClick={async () => { setError(''); try { await admin.signInWithGoogle(); const session = await admin.getSession(); setSessionEmail(session.email) } catch (err) { setError(err instanceof Error ? err.message : 'admin_session_failed') } }}>{t('continue')} Google</Button></Card></main>
-  return children
-}
 
-function GrantSubscriptionDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { t, locale } = useExperience()
-  const { admin } = useAdapters()
-  const [email, setEmail] = useState('')
-  const [uid, setUid] = useState('')
-  const [plan, setPlan] = useState<'weekly' | 'monthly' | 'annual' | 'lifetime' | 'custom' | 'manual'>('monthly')
-  const [operation, setOperation] = useState<'extend_current' | 'replace_current' | 'start_from_now' | 'restore_remaining_time'>('start_from_now')
-  const [durationMode, setDurationMode] = useState<'duration' | 'exact' | 'lifetime'>('duration')
-  const [durationValue, setDurationValue] = useState('5')
-  const [durationUnit, setDurationUnit] = useState<'hours' | 'days' | 'weeks' | 'months'>('days')
-  const [exactExpiry, setExactExpiry] = useState('')
-  const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC')
-  const [reason, setReason] = useState('')
-  const [preview, setPreview] = useState<ManualGrantPreview | null>(null)
-  const [result, setResult] = useState<{ request_id?: string; expires_at?: string; replay?: boolean } | null>(null)
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [idempotencyKey, setIdempotencyKey] = useState(() => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`))
-  const exactIso = exactExpiry ? new Date(exactExpiry).toISOString() : undefined
-  const grantInput = {
-    target_email: email.trim() || undefined,
-    target_firebase_uid: uid.trim() || undefined,
-    operation_type: operation,
-    plan,
-    duration_mode: plan === 'lifetime' ? 'lifetime' as const : durationMode,
-    duration_value: durationMode === 'duration' ? Number(durationValue) : undefined,
-    duration_unit: durationUnit,
-    exact_expiry: durationMode === 'exact' ? exactIso : undefined,
-    timezone,
-    reason: reason.trim() || undefined,
-  }
-  const resetOutcome = () => { setPreview(null); setResult(null); setError('') }
-  const runPreview = async () => {
-    setBusy(true); setError(''); setResult(null)
-    try {
-      const next = await admin.previewManualGrant(grantInput)
-      setPreview(next)
-    } catch (err) {
-      setPreview(null)
-      setError(err instanceof Error ? err.message : 'preview_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-  const execute = async () => {
-    if (!preview) return
-    setBusy(true); setError('')
-    try {
-      const data = await admin.executeManualGrant({ ...grantInput, reason: reason.trim(), idempotency_key: idempotencyKey, preview_hash: preview.preview_hash })
-      setResult({ request_id: data.request_id, expires_at: data.item?.expires_at, replay: data.idempotent_replay })
-      setPreview(data.preview)
-      setIdempotencyKey(typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'grant_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-  const close = () => {
-    resetOutcome()
-    onClose()
-  }
-  const hasRequiredTarget = Boolean(uid.trim() || email.trim())
-  const canExecute = Boolean(preview && !preview.blocked && reason.trim().length >= 3 && uid.trim())
-  return <Drawer open={open} onClose={close} title={t('grantTitle')} description={copyByLocale(locale, 'Review the change before confirming it.', 'راجع التغييرات قبل التأكيد.')} closeLabel={t('close')} footer={<div className="cluster"><Button onClick={runPreview} loading={busy} disabled={!hasRequiredTarget}>{copyByLocale(locale, 'Preview', 'معاينة')}</Button><Button variant="primary" onClick={execute} loading={busy} disabled={!canExecute}>{t('confirmGrant')}</Button></div>}><div className="stack"><div className="form-grid"><FormField label={copyByLocale(locale, 'Firebase UID', 'معرّف Firebase')} htmlFor="grant-uid" required><Input id="grant-uid" value={uid} onChange={(event) => { setUid(event.target.value); resetOutcome() }} /></FormField><FormField label={t('email')} htmlFor="grant-email"><Input id="grant-email" value={email} onChange={(event) => { setEmail(event.target.value); resetOutcome() }} /></FormField></div><div className="form-grid"><FormField label={t('plan')} htmlFor="grant-plan"><Select id="grant-plan" value={plan} onChange={(event) => { setPlan(event.target.value as typeof plan); resetOutcome() }}><option value="weekly">weekly</option><option value="monthly">monthly</option><option value="annual">annual</option><option value="lifetime">lifetime</option><option value="custom">custom</option><option value="manual">manual</option></Select></FormField><FormField label={copyByLocale(locale, 'Operation', 'الإجراء')} htmlFor="grant-operation"><Select id="grant-operation" value={operation} onChange={(event) => { setOperation(event.target.value as typeof operation); resetOutcome() }}><option value="extend_current">{copyByLocale(locale, 'Extend current subscription', 'تمديد الاشتراك الحالي')}</option><option value="replace_current">{copyByLocale(locale, 'Replace subscription', 'استبدال الاشتراك')}</option><option value="start_from_now">{copyByLocale(locale, 'Start from now', 'بدء اشتراك من الآن')}</option><option value="restore_remaining_time">{copyByLocale(locale, 'Restore remaining time', 'استعادة المدة المتبقية')}</option></Select></FormField></div>{plan !== 'lifetime' ? <div className="form-grid"><FormField label={copyByLocale(locale, 'Duration mode', 'طريقة تحديد المدة')} htmlFor="grant-duration-mode"><Select id="grant-duration-mode" value={durationMode} onChange={(event) => { setDurationMode(event.target.value as typeof durationMode); resetOutcome() }}><option value="duration">{copyByLocale(locale, 'Duration', 'مدة')}</option><option value="exact">{copyByLocale(locale, 'Exact expiry', 'تاريخ انتهاء محدد')}</option></Select></FormField>{durationMode === 'duration' ? <><FormField label={copyByLocale(locale, 'Value', 'القيمة')} htmlFor="grant-duration-value"><Input id="grant-duration-value" type="number" min="1" value={durationValue} onChange={(event) => { setDurationValue(event.target.value); resetOutcome() }} /></FormField><FormField label={copyByLocale(locale, 'Unit', 'الوحدة')} htmlFor="grant-duration-unit"><Select id="grant-duration-unit" value={durationUnit} onChange={(event) => { setDurationUnit(event.target.value as typeof durationUnit); resetOutcome() }}><option value="hours">{copyByLocale(locale, 'Hours', 'ساعات')}</option><option value="days">{copyByLocale(locale, 'Days', 'أيام')}</option><option value="weeks">{copyByLocale(locale, 'Weeks', 'أسابيع')}</option><option value="months">{copyByLocale(locale, 'Months', 'شهور')}</option></Select></FormField></> : <><FormField label={t('expiryDate')} htmlFor="grant-exact"><Input id="grant-exact" type="datetime-local" value={exactExpiry} onChange={(event) => { setExactExpiry(event.target.value); resetOutcome() }} /></FormField><FormField label={copyByLocale(locale, 'Timezone', 'المنطقة الزمنية')} htmlFor="grant-timezone"><Input id="grant-timezone" value={timezone} onChange={(event) => { setTimezone(event.target.value); resetOutcome() }} /></FormField></>}</div> : null}<FormField label={t('reason')} htmlFor="grant-reason" required><Textarea id="grant-reason" value={reason} onChange={(event) => { setReason(event.target.value); setResult(null) }} /></FormField>{preview ? <Card padding="sm"><SectionHeader title={copyByLocale(locale, 'Preview', 'المعاينة')} description={preview.blocked ? copyByLocale(locale, 'Resolve the warnings before confirming.', 'عالج التحذيرات قبل التأكيد.') : copyByLocale(locale, 'Confirm only after reviewing the result.', 'أكّد فقط بعد مراجعة النتيجة.')} /><dl className="detail-list"><div><dt>{copyByLocale(locale, 'Current status', 'الحالة الحالية')}</dt><dd>{preview.current_subscription?.status || copyByLocale(locale, 'No active subscription', 'لا يوجد اشتراك نشط')}</dd></div><div><dt>{copyByLocale(locale, 'New expiry', 'تاريخ الانتهاء الجديد')}</dt><dd>{formatDisplayDate(preview.proposed_state.expires_at, locale)}</dd></div><div><dt>{t('plan')}</dt><dd>{preview.proposed_state.plan_intent}</dd></div><div><dt>{copyByLocale(locale, 'Affected rows', 'السجلات المتأثرة')}</dt><dd>{preview.affected_rows.length || 1}</dd></div></dl>{preview.warnings.length ? <Alert title={copyByLocale(locale, 'Needs review', 'تحتاج مراجعة')} tone={preview.blocked ? 'danger' : 'warning'}>{preview.warnings.join(', ')}</Alert> : null}{!uid.trim() ? <Alert title={copyByLocale(locale, 'Firebase UID required', 'معرّف Firebase مطلوب')} tone="warning">{copyByLocale(locale, 'Execution requires the user UID, even if email is used for search.', 'التنفيذ يتطلب معرّف المستخدم حتى لو استُخدم البريد في البحث.')}</Alert> : null}</Card> : null}{result ? <Alert title={t('success')} tone="success">{copyByLocale(locale, `Grant applied. Reference: ${result.request_id || '—'}`, `تم منح الاشتراك. المرجع: ${result.request_id || '—'}`)}</Alert> : null}{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}</div></Drawer>
-}
 
-// Unrouted compatibility components remain outside the active admin surface.
-void [AdminOverviewSkeleton, AdminSubscriptionsSkeleton, GrantSubscriptionDrawer]
 
-function AdminReleases() {
-  const { t, locale } = useExperience()
-  const adapters = useAdapters()
-  const [channel, setChannel] = useState<'stable' | 'beta'>('beta')
-  const releases = useAsyncData(() => adapters.admin.listReleases(channel), [adapters, channel])
-  const latestRelease = releases.data?.[0] || null
-  const latestChecksum = latestRelease?.artifacts?.installed?.sha256 || latestRelease?.download_sha256 || ''
-  const [version, setVersion] = useState('')
-  const [notes, setNotes] = useState('')
-  const [mandatory, setMandatory] = useState(false)
-  const [updateMode, setUpdateMode] = useState<'optional' | 'force' | 'required' | 'silent'>('optional')
-  const [artifactType, setArtifactType] = useState<'portable' | 'installed'>('installed')
-  const [file, setFile] = useState<File | null>(null)
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [previewOpen, setPreviewOpen] = useState(false)
-  const [acknowledged, setAcknowledged] = useState(false)
-  const [fileInputKey, setFileInputKey] = useState(0)
-  const submit = async (event: FormEvent) => {
-    event.preventDefault()
-    setError('')
-    setNotice('')
-    if (!version.trim() || !notes.trim()) {
-      setError(copyByLocale(locale, 'Enter a version and release notes.', 'أدخل الإصدار وملاحظات الإصدار.'))
-      return
-    }
-    if (latestRelease?.available && latestRelease.version && compareReleaseVersions(version, latestRelease.version) <= 0) {
-      setError(copyByLocale(
-        locale,
-        `Enter a version newer than the current ${channel} release (${latestRelease.version}).`,
-        `أدخل إصدارًا أحدث من الإصدار الحالي لقناة ${channel} (${latestRelease.version}).`,
-      ))
-      return
-    }
-    setPreviewOpen(true)
-  }
-  const confirmPublish = async () => {
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      if (file) await adapters.admin.uploadRelease({ file, version, channel, artifactType })
-      await adapters.admin.publishRelease({ version, channel, notes, mandatory, updateMode })
-      setNotice(copyByLocale(
-        locale,
-        `Published ${version} to ${channel}. Clients on older versions will receive it.`,
-        `تم نشر ${version} على قناة ${channel}. سيظهر للنسخ الأقدم منه.`,
-      ))
-      setPreviewOpen(false)
-      setAcknowledged(false)
-      setVersion('')
-      setNotes('')
-      setFile(null)
-      setFileInputKey((value) => value + 1)
-      releases.reload()
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'release_publish_failed'
-      setError(message === 'same_version_already_active' || message === 'release_version_not_newer'
-        ? copyByLocale(locale, 'The release version must be newer than the active channel version.', 'يجب أن يكون إصدار التحديث أحدث من الإصدار المنشور على القناة.')
-        : message)
-    } finally {
-      setBusy(false)
-    }
-  }
-  return <><PageHeader title={t('releases')} description={t('managedUpdates')} />{releases.error ? <ErrorBlock error={releases.error} onRetry={releases.reload} /> : <Card><dl className="detail-list"><div><dt>{t('channel')}</dt><dd>{channel}</dd></div><div><dt>{t('version')}</dt><dd>{latestRelease?.version || t('unavailable')}</dd></div><div><dt>{t('mandatory')}</dt><dd>{latestRelease?.mandatory ? t('enabled') : t('disabled')}</dd></div><div><dt>SHA256</dt><dd>{latestChecksum || '—'}</dd></div></dl></Card>}<Card><SectionHeader title={t('publishRelease')} description={t('managedUpdates')} /><form className="settings-form" onSubmit={submit}><div className="form-grid"><FormField label={t('version')} htmlFor="release-version" required><Input id="release-version" value={version} onChange={(event) => setVersion(event.target.value)} required /></FormField><FormField label={t('channel')} htmlFor="release-channel" required><Select id="release-channel" value={channel} onChange={(event) => { setChannel(event.target.value as 'stable' | 'beta'); setVersion(''); setFile(null); setError(''); setNotice(''); setFileInputKey((value) => value + 1) }}><option value="beta">{t('beta')}</option><option value="stable">{t('stable')}</option></Select></FormField></div><div className="form-grid"><FormField label={t('type')} htmlFor="release-artifact"><Select id="release-artifact" value={artifactType} onChange={(event) => { setArtifactType(event.target.value as 'portable' | 'installed'); setVersion(''); setFile(null); setError(''); setFileInputKey((value) => value + 1) }}><option value="installed">{copyByLocale(locale, 'Installed update', 'تحديث النسخة المثبتة')}</option><option value="portable">{copyByLocale(locale, 'Portable application', 'نسخة محمولة')}</option></Select></FormField><FormField label={t('availability')} htmlFor="release-mode"><Select id="release-mode" value={updateMode} onChange={(event) => setUpdateMode(event.target.value as 'optional' | 'force' | 'required' | 'silent')}><option value="optional">{copyByLocale(locale, 'Optional', 'اختياري')}</option><option value="required">{copyByLocale(locale, 'Required', 'مطلوب')}</option><option value="force">{copyByLocale(locale, 'Mandatory', 'إجباري')}</option><option value="silent">{copyByLocale(locale, 'Background', 'في الخلفية')}</option></Select></FormField></div><FormField label={t('uploadArtifact')} htmlFor="release-file"><Input key={fileInputKey} id="release-file" type="file" accept={artifactType === 'installed' ? '.zip,application/zip,application/x-zip-compressed' : '.exe,application/vnd.microsoft.portable-executable'} onChange={(event) => { setFile(event.target.files?.[0] || null); setError('') }} /></FormField><FormField label={t('releaseNotes')} htmlFor="release-notes"><Textarea id="release-notes" value={notes} onChange={(event) => setNotes(event.target.value)} /></FormField><label className="ui-checkbox"><input type="checkbox" checked={mandatory} onChange={(event) => setMandatory(event.target.checked)} />{t('mandatory')}</label><Button type="submit" variant="primary" loading={busy}>{copyByLocale(locale, 'Review release', 'مراجعة الإصدار')}</Button>{error ? <Alert title={t('failed')} tone="danger">{userFacingErrorMessage(error, locale)}</Alert> : null}{notice ? <Alert title={t('success')} tone="success">{notice}</Alert> : null}</form></Card><Modal open={previewOpen} onClose={() => setPreviewOpen(false)} title={copyByLocale(locale, 'Confirm release publication', 'تأكيد نشر الإصدار')} description={copyByLocale(locale, 'Review the artifact and targeting before publishing.', 'راجع الملف والاستهداف قبل النشر.')} closeLabel={t('close')} footer={<><Button onClick={() => setPreviewOpen(false)}>{copyByLocale(locale, 'Back', 'رجوع')}</Button><Button variant="danger" loading={busy} disabled={!acknowledged} onClick={confirmPublish}>{copyByLocale(locale, 'Publish release', 'نشر الإصدار')}</Button></>}><div className="stack"><dl className="detail-list"><div><dt>{t('version')}</dt><dd>{version}</dd></div><div><dt>{t('channel')}</dt><dd>{channel}</dd></div><div><dt>{t('type')}</dt><dd>{artifactType}</dd></div><div><dt>{t('uploadArtifact')}</dt><dd>{file ? `${file.name} · ${file.size} bytes` : copyByLocale(locale, 'No new artifact', 'لا يوجد ملف جديد')}</dd></div><div><dt>{t('mandatory')}</dt><dd>{mandatory ? t('enabled') : t('disabled')}</dd></div></dl><label className="ui-check"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /><span>{copyByLocale(locale, 'I reviewed the release scope and artifact.', 'راجعت نطاق الإصدار والملف.')}</span></label></div></Modal></>
-}
 
-function AdminSupportV2() {
-  const { t, locale } = useExperience()
-  const { admin } = useAdapters()
-  const [selected, setSelected] = useState<AdminSupportThread | null>(null)
-  const [reply, setReply] = useState('')
-  const [internalNote, setInternalNote] = useState('')
-  const [replyMode, setReplyMode] = useState<'portal' | 'portal_email'>('portal')
-  const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState('')
-  const [priorityFilter, setPriorityFilter] = useState('')
-  const [statusReason, setStatusReason] = useState('')
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
-  const [busy, setBusy] = useState(false)
-  const threads = useAsyncData(() => admin.listSupportThreads(), [admin])
-  const messages = useAsyncData(() => selected ? admin.listSupportMessages(selected.id) : Promise.resolve([]), [admin, selected?.id])
-  const audit = useAsyncData(() => selected ? admin.listSupportAudit(selected.id) : Promise.resolve([]), [admin, selected?.id])
-  const visibleThreads = useMemo(() => {
-    const query = search.trim().toLowerCase()
-    return (threads.data || []).filter((row) => {
-      const ticketNumber = stableTicketNumber(row.id, row.created_at, row.updated_at)
-      const status = String(row.status || 'open').toLowerCase()
-      const matchesStatus = !statusFilter || status === statusFilter || (statusFilter === 'awaiting_customer' && ['waiting_for_customer', 'answered'].includes(status)) || (statusFilter === 'awaiting_support' && status === 'waiting_for_support')
-      const haystack = [ticketNumber, row.subject, row.email, row.install_id, row.device_id, row.last_message_body].filter(Boolean).join(' ').toLowerCase()
-      const matchesPriority = !priorityFilter || String(row.priority || 'normal').toLowerCase() === priorityFilter
-      return matchesStatus && matchesPriority && (!query || haystack.includes(query))
-    })
-  }, [threads.data, search, statusFilter, priorityFilter])
-  const columns: Column<AdminSupportThread>[] = [
-    { key: 'ticket', header: '#', render: (row) => <div><strong>{stableTicketNumber(row.id, row.created_at, row.updated_at)}</strong>{row.unread_count ? <small className="muted">{row.unread_count} unread</small> : null}</div> },
-    { key: 'customer', header: t('email'), render: (row) => <div><strong>{row.email || '—'}</strong><small className="muted">{row.install_id || row.device_id || ''}</small></div> },
-    { key: 'subject', header: t('support'), render: (row) => <div><strong>{row.subject}</strong><small className="muted">{row.last_message_body || ''}</small></div> },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={supportStatusTone(row.status)}>{supportStatusLabel(row.status, locale)}</Badge> },
-    { key: 'updated', header: t('date'), render: (row) => formatDisplayDate(row.updated_at, locale) },
-  ]
-
-  const sendReply = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.sendSupportReply(selected.id, reply, { emailRequested: replyMode === 'portal_email' })
-      setReply('')
-      setNotice(t('success'))
-      messages.reload()
-      audit.reload()
-      threads.reload()
-    } catch (err) {
-      setError(supportErrorMessage(err, locale))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const saveInternalNote = async () => {
-    if (!selected || !internalNote.trim()) return
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.sendSupportReply(selected.id, internalNote, { internal: true })
-      setInternalNote('')
-      setNotice(t('success'))
-      messages.reload()
-      audit.reload()
-      threads.reload()
-    } catch (err) {
-      setError(supportErrorMessage(err, locale))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const changeStatus = async (status: string) => {
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.updateSupportStatus(selected.id, status, statusReason)
-      setSelected({ ...selected, status, updated_at: new Date().toISOString() })
-      setStatusReason('')
-      setNotice(t('success'))
-      messages.reload()
-      audit.reload()
-      threads.reload()
-      audit.reload()
-    } catch (err) {
-      setError(supportErrorMessage(err, locale))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const changePriority = async (priority: 'low' | 'normal' | 'high' | 'urgent') => {
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.updateSupportPriority(selected.id, priority)
-      setSelected({ ...selected, priority, updated_at: new Date().toISOString() })
-      setNotice(t('success'))
-      audit.reload()
-      threads.reload()
-    } catch (err) {
-      setError(supportErrorMessage(err, locale))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const copyTicketNumber = async () => {
-    if (!selected) return
-    await navigator.clipboard?.writeText(stableTicketNumber(selected.id, selected.created_at, selected.updated_at))
-    setNotice(t('success'))
-  }
-  const toggleBlock = async () => {
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    try {
-      const result = await admin.setSupportBlocked(selected.id, !selected.support_blocked, selected.support_blocked ? undefined : 'admin_block')
-      setSelected({ ...selected, support_blocked: result.blocked, status: result.status || selected.status })
-      threads.reload()
-      setNotice(t('success'))
-    } catch (err) {
-      setError(supportErrorMessage(err, locale))
-    } finally {
-      setBusy(false)
-    }
-  }
-  return <><PageHeader title={t('supportInbox')} description={copyByLocale(locale, 'Manage customer support threads, internal notes, status changes, and sender blocks.', 'إدارة تذاكر الدعم، الملاحظات الداخلية، تغييرات الحالة، وحظر المرسلين.')} /><TableToolbar searchLabel={t('search')} searchValue={search} onSearch={setSearch} filters={<div className="cluster"><Select aria-label={t('status')} value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">{t('status')}</option><option value="open">{supportStatusLabel('open', locale)}</option><option value="awaiting_support">{supportStatusLabel('awaiting_support', locale)}</option><option value="awaiting_customer">{supportStatusLabel('awaiting_customer', locale)}</option><option value="reopened">{supportStatusLabel('reopened', locale)}</option><option value="closed">{supportStatusLabel('closed', locale)}</option><option value="blocked">{supportStatusLabel('blocked', locale)}</option></Select><Select aria-label={copyByLocale(locale, 'Priority', 'الأولوية')} value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}><option value="">{copyByLocale(locale, 'All priorities', 'كل الأولويات')}</option><option value="urgent">{copyByLocale(locale, 'Urgent', 'عاجلة')}</option><option value="high">{copyByLocale(locale, 'High', 'مرتفعة')}</option><option value="normal">{copyByLocale(locale, 'Normal', 'عادية')}</option><option value="low">{copyByLocale(locale, 'Low', 'منخفضة')}</option></Select></div>} />{threads.error ? <ErrorBlock error={supportErrorMessage(threads.error, locale)} onRetry={threads.reload} /> : <DataTable columns={columns} rows={visibleThreads} loading={threads.loading} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={t('supportInbox')} onRowClick={(row) => { setSelected(row); setError(''); setNotice(''); setReply(''); setInternalNote('') }} />}{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}{notice ? <Alert title={t('success')} tone="success">{notice}</Alert> : null}<Drawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected ? stableTicketNumber(selected.id, selected.created_at, selected.updated_at) : t('support')} description={selected?.subject || t('support')} closeLabel={t('close')}><div className="support-admin-head"><div><Badge tone={supportStatusTone(selected?.status)}>{supportStatusLabel(selected?.status, locale)}</Badge><span>{selected?.email || '—'}</span><small>{selected?.app_version || selected?.platform || ''}</small></div><div className="cluster"><Button size="sm" leadingIcon={<Copy size={14} />} onClick={copyTicketNumber}>{copyByLocale(locale, 'Copy ticket number', 'نسخ رقم التذكرة')}</Button><Button size="sm" variant="secondary" onClick={toggleBlock} disabled={!selected || busy}>{selected?.support_blocked ? t('enabled') : t('blockSender')}</Button></div></div><div className="form-grid"><FormField label={t('status')} htmlFor="admin-ticket-status"><Select id="admin-ticket-status" value={selected?.status === 'blocked' ? 'awaiting_support' : selected?.status || 'open'} onChange={(event) => changeStatus(event.target.value)}><option value="open">{supportStatusLabel('open', locale)}</option><option value="awaiting_support">{supportStatusLabel('awaiting_support', locale)}</option><option value="awaiting_customer">{supportStatusLabel('awaiting_customer', locale)}</option><option value="reopened">{supportStatusLabel('reopened', locale)}</option><option value="closed">{supportStatusLabel('closed', locale)}</option></Select></FormField><FormField label={copyByLocale(locale, 'Priority', 'الأولوية')} htmlFor="admin-ticket-priority"><Select id="admin-ticket-priority" value={selected?.priority || 'normal'} onChange={(event) => { void changePriority(event.target.value as 'low' | 'normal' | 'high' | 'urgent') }}><option value="urgent">{copyByLocale(locale, 'Urgent', 'عاجلة')}</option><option value="high">{copyByLocale(locale, 'High', 'مرتفعة')}</option><option value="normal">{copyByLocale(locale, 'Normal', 'عادية')}</option><option value="low">{copyByLocale(locale, 'Low', 'منخفضة')}</option></Select></FormField><FormField label={t('reason')} htmlFor="support-status-reason"><Input id="support-status-reason" value={statusReason} onChange={(event) => setStatusReason(event.target.value)} /></FormField></div>{messages.error ? <ErrorBlock error={supportErrorMessage(messages.error, locale)} onRetry={messages.reload} /> : null}<div className="support-thread">{messages.loading ? <LoadingBlock label={t('loading')} /> : messages.data?.map((message) => <SupportThreadMessage key={message.id} message={message} locale={locale} />)}</div><Card padding="sm"><SectionHeader title={copyByLocale(locale, 'History', 'السجل')} />{audit.loading ? <SkeletonStack rows={3} /> : audit.error ? <ErrorBlock error={supportErrorMessage(audit.error, locale)} onRetry={audit.reload} /> : audit.data?.length ? <div className="support-audit-list">{audit.data.map((event) => <div key={event.id}><strong>{supportAuditLabel(event.event_type, locale)}</strong><small>{formatDisplayDate(event.created_at, locale)}</small></div>)}</div> : <EmptyState title={copyByLocale(locale, 'No history yet', 'لا يوجد سجل بعد')} body={copyByLocale(locale, 'Ticket activity will appear here.', 'سيظهر نشاط التذكرة هنا.')} />}</Card><form className="settings-form" onSubmit={sendReply}><div className="form-grid"><FormField label={t('type')} htmlFor="admin-support-mode"><Select id="admin-support-mode" value={replyMode} onChange={(event) => setReplyMode(event.target.value as 'portal' | 'portal_email')}><option value="portal">{copyByLocale(locale, 'Portal only', 'البوابة فقط')}</option><option value="portal_email">{copyByLocale(locale, 'Portal + email', 'البوابة + البريد')}</option></Select></FormField></div>{replyMode === 'portal_email' && !EMAIL_SUPPORT_ENABLED ? <Alert title={copyByLocale(locale, 'Email provider required', 'يتطلب مزود بريد')} tone="warning">{copyByLocale(locale, 'The reply will be saved in the portal. Email sending stays off until a transactional email provider is configured.', 'سيتم حفظ الرد داخل البوابة فقط. إرسال البريد يظل متوقفًا حتى يتم إعداد مزود بريد للرسائل التشغيلية.')}</Alert> : null}<FormField label={t('reply')} htmlFor="admin-support-reply"><Textarea id="admin-support-reply" value={reply} maxLength={4000} onChange={(event) => setReply(event.target.value)} required /></FormField><Button type="submit" variant="primary" loading={busy}>{t('reply')}</Button></form><Card padding="sm"><SectionHeader title={copyByLocale(locale, 'Internal note', 'ملاحظة داخلية')} description={copyByLocale(locale, 'Visible only to administrators.', 'تظهر للمديرين فقط.')} /><FormField label={t('adminNote')} htmlFor="admin-internal-note"><Textarea id="admin-internal-note" value={internalNote} maxLength={4000} onChange={(event) => setInternalNote(event.target.value)} /></FormField><Button type="button" onClick={saveInternalNote} loading={busy}>{t('save')}</Button></Card></Drawer></>
-}
-
-export function AdminSupport() {
-  const { t, locale } = useExperience()
-  const { admin } = useAdapters()
-  const [selected, setSelected] = useState<AdminSupportThread | null>(null)
-  const [reply, setReply] = useState('')
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
-  const [busy, setBusy] = useState(false)
-  const threads = useAsyncData(() => admin.listSupportThreads(), [admin])
-  const messages = useAsyncData(() => selected ? admin.listSupportMessages(selected.id) : Promise.resolve([]), [admin, selected?.id])
-  const columns: Column<AdminSupportThread>[] = [{ key: 'subject', header: t('support'), render: (row) => row.subject }, { key: 'email', header: t('email'), render: (row) => row.email || '—' }, { key: 'status', header: t('status'), render: (row) => <Badge>{row.status || 'open'}</Badge> }, { key: 'updated', header: t('date'), render: (row) => formatDisplayDate(row.updated_at, locale) }]
-  const sendReply = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.sendSupportReply(selected.id, reply)
-      setReply('')
-      setNotice(t('success'))
-      messages.reload()
-      threads.reload()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'support_reply_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-  const toggleBlock = async () => {
-    if (!selected) return
-    setBusy(true)
-    setError('')
-    try {
-      await admin.setSupportBlocked(selected.id, !selected.support_blocked, selected.support_blocked ? undefined : 'admin_block')
-      setSelected({ ...selected, support_blocked: !selected.support_blocked })
-      threads.reload()
-      setNotice(t('success'))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'support_block_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-  return <><PageHeader title={t('supportInbox')} description={t('support')} />{threads.error ? <ErrorBlock error={threads.error} onRetry={threads.reload} /> : <DataTable columns={columns} rows={threads.data || []} loading={threads.loading} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={t('supportInbox')} onRowClick={(row) => { setSelected(row); setError(''); setNotice(''); setReply('') }} />}{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}{notice ? <Alert title={t('success')} tone="success">{notice}</Alert> : null}<Drawer open={Boolean(selected)} onClose={() => setSelected(null)} title={selected?.subject || t('support')} closeLabel={t('close')}><div className="support-thread">{messages.loading ? <LoadingBlock label={t('loading')} /> : messages.data?.map((message) => <SupportThreadMessage key={message.id} message={message} locale={locale} />)}</div><form className="settings-form" onSubmit={sendReply}><FormField label={t('reply')} htmlFor="admin-support-reply"><Textarea id="admin-support-reply" value={reply} onChange={(event) => setReply(event.target.value)} required /></FormField><div className="cluster"><Button type="submit" variant="primary" loading={busy}>{t('reply')}</Button><Button type="button" variant="secondary" onClick={toggleBlock} disabled={!selected || busy}>{selected?.support_blocked ? t('enabled') : t('blockSender')}</Button></div></form></Drawer></>
-}
-
-function AdminEmailOperations() {
-  const { t, locale } = useExperience()
-  const { admin } = useAdapters()
-  const status = useAsyncData(() => admin.getEmailOperations(), [admin])
-  const [tab, setTab] = useState('catalog')
-  const [recipient, setRecipient] = useState('')
-  const [emailType, setEmailType] = useState('admin.email_test')
-  const [testLocale, setTestLocale] = useState<'ar' | 'en'>(locale)
-  const [notice, setNotice] = useState('')
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const data = status.data as AdminEmailStatus | null
-  const catalog = data?.catalog || []
-  const testableCatalog = catalog.filter((item) => item.admin_test_allowed !== false && item.integration_status !== 'disabled')
-  const categoryFlags = data?.config.category_flags || {}
-  if (status.loading && !data) return <AdminEmailOperationsSkeleton />
-
-  const sendTest = async (event: FormEvent) => {
-    event.preventDefault()
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.sendAdminTestEmail({ recipient, emailType, locale: testLocale })
-      setNotice(copyByLocale(locale, 'Test email queued.', 'تمت إضافة رسالة الاختبار إلى الطابور.'))
-      status.reload()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'email_test_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const processQueue = async () => {
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      const result = await admin.processEmailOutbox()
-      setNotice(copyByLocale(locale, `Processed ${result.processed}; sent ${result.sent}.`, `تمت معالجة ${result.processed}؛ تم إرسال ${result.sent}.`))
-      status.reload()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'email_process_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const retryJob = async (jobId: string) => {
-    setBusy(true)
-    setError('')
-    setNotice('')
-    try {
-      await admin.retryEmailJob(jobId)
-      setNotice(copyByLocale(locale, 'Retry requested.', 'تم طلب إعادة المحاولة.'))
-      status.reload()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'email_retry_failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const catalogColumns: Column<AdminEmailCatalogItem>[] = [
-    { key: 'event', header: copyByLocale(locale, 'Event', 'الحدث'), render: (row) => <div><strong>{locale === 'ar' ? row.title_ar : row.title_en}</strong><small className="muted">{row.event_type}</small></div> },
-    { key: 'category', header: copyByLocale(locale, 'Category', 'التصنيف'), render: (row) => <Badge>{row.category}</Badge> },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={emailIntegrationTone(row.integration_status)}>{row.integration_status}</Badge> },
-    { key: 'sender', header: copyByLocale(locale, 'Sender', 'المرسل'), render: (row) => row.sender_identity },
-    { key: 'template', header: copyByLocale(locale, 'Template', 'القالب'), render: (row) => `${row.template_key} v${row.template_version}` },
-  ]
-  const jobColumns: Column<AdminEmailJob>[] = [
-    { key: 'type', header: copyByLocale(locale, 'Type', 'النوع'), render: (row) => <div><strong>{row.catalog_event_type || row.email_type}</strong><small className="muted">{row.template_key || ''}</small></div> },
-    { key: 'recipient', header: copyByLocale(locale, 'Recipient', 'المستلم'), render: (row) => row.recipient },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={emailJobTone(row.status)}>{row.status}</Badge> },
-    { key: 'attempts', header: copyByLocale(locale, 'Attempts', 'المحاولات'), render: (row) => `${row.attempt_count || 0}/${row.max_attempts || 0}` },
-    { key: 'date', header: t('date'), render: (row) => formatDisplayDate(row.created_at || row.updated_at, locale) },
-    { key: 'actions', header: t('actions'), render: (row) => <Button type="button" size="sm" onClick={() => retryJob(row.id)} disabled={busy}>{copyByLocale(locale, 'Retry', 'إعادة')}</Button> },
-  ]
-  const scheduledColumns: Column<AdminScheduledEmail>[] = [
-    { key: 'type', header: copyByLocale(locale, 'Type', 'النوع'), render: (row) => row.event_type },
-    { key: 'recipient', header: copyByLocale(locale, 'Recipient', 'المستلم'), render: (row) => row.recipient },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={emailJobTone(row.status)}>{row.status}</Badge> },
-    { key: 'scheduled', header: copyByLocale(locale, 'Scheduled for', 'موعد الإرسال'), render: (row) => row.scheduled_for },
-    { key: 'error', header: t('details'), render: (row) => row.last_error || '—' },
-  ]
-  const inboundColumns: Column<AdminInboundEmailMessage>[] = [
-    { key: 'from', header: copyByLocale(locale, 'From', 'من'), render: (row) => row.sender_email || '—' },
-    { key: 'to', header: copyByLocale(locale, 'To', 'إلى'), render: (row) => row.recipient_email || '—' },
-    { key: 'subject', header: t('details'), render: (row) => row.subject || row.rejection_reason || '—' },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={emailJobTone(row.status)}>{row.status}</Badge> },
-    { key: 'date', header: t('date'), render: (row) => formatDisplayDate(row.received_at || row.created_at, locale) },
-  ]
-  const providerColumns: Column<AdminEmailProviderEvent>[] = [
-    { key: 'event', header: copyByLocale(locale, 'Provider event', 'حدث المزود'), render: (row) => <Badge tone={emailJobTone(row.event_type)}>{row.event_type}</Badge> },
-    { key: 'message', header: copyByLocale(locale, 'Message ID', 'معرف الرسالة'), render: (row) => row.provider_message_id || '—' },
-    { key: 'job', header: copyByLocale(locale, 'Job', 'المهمة'), render: (row) => row.email_job_id || '—' },
-    { key: 'date', header: t('date'), render: (row) => formatDisplayDate(row.created_at || row.processed_at, locale) },
-  ]
-  const flagColumns: Column<AdminEmailRecipientFlag>[] = [
-    { key: 'email', header: t('email'), render: (row) => row.email },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={emailJobTone(row.status)}>{row.status}</Badge> },
-    { key: 'reason', header: t('reason'), render: (row) => row.reason || '—' },
-    { key: 'date', header: t('date'), render: (row) => formatDisplayDate(row.updated_at || row.created_at, locale) },
-  ]
-
-  return (
-    <>
-      <PageHeader
-        title={copyByLocale(locale, 'Email Operations', 'عمليات البريد')}
-        description={copyByLocale(locale, 'Transactional email catalog, queue, provider webhooks, and suppression state.', 'كتالوج الرسائل التشغيلية والطابور وأحداث المزود وحالات الحظر.')}
-        actions={<Button type="button" leadingIcon={<RefreshCcw size={15} />} onClick={status.reload}>{t('retry')}</Button>}
-      />
-      {status.error ? <ErrorBlock error={status.error} onRetry={status.reload} /> : null}
-      {data ? (
-        <>
-          <div className="admin-metric-strip">
-            <StatCard label={copyByLocale(locale, 'Outbound', 'الإرسال')} value={boolLabel(data.config.outbound_enabled, locale)} />
-            <StatCard label={copyByLocale(locale, 'Inbound', 'الاستقبال')} value={boolLabel(data.config.inbound_enabled, locale)} />
-            <StatCard label={copyByLocale(locale, 'Scheduler', 'الجدولة')} value={boolLabel(data.config.scheduler_enabled, locale)} />
-            <StatCard label={copyByLocale(locale, 'Send key', 'مفتاح الإرسال')} value={boolLabel(data.config.has_resend_send_api_key, locale)} />
-            <StatCard label={copyByLocale(locale, 'Receive key', 'مفتاح الاستقبال')} value={boolLabel(data.config.has_resend_receive_api_key, locale)} />
-            <StatCard label={copyByLocale(locale, 'Webhook secret', 'توقيع Webhook')} value={boolLabel(data.config.has_resend_webhook_secret, locale)} />
-            <StatCard label={copyByLocale(locale, 'Linked', 'مربوط')} value={data.metrics?.catalog_linked ?? 0} />
-            <StatCard label={copyByLocale(locale, 'Prepared', 'جاهز')} value={data.metrics?.catalog_prepared ?? 0} />
-            <StatCard label={copyByLocale(locale, 'Disabled', 'معطل')} value={data.metrics?.catalog_disabled ?? 0} />
-            <StatCard label={copyByLocale(locale, 'Queued', 'الطابور')} value={data.jobs.length} />
-          </div>
-          <div className="admin-overview-grid">
-            <Card>
-              <SectionHeader title={copyByLocale(locale, 'Sender identities', 'هويات الإرسال')} description={data.config.reply_domain} />
-              <dl className="detail-list">
-                {Object.entries(data.config.sender_identities || { general: data.config.from }).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}
-              </dl>
-            </Card>
-            <Card>
-              <SectionHeader title={copyByLocale(locale, 'Category flags', 'تفعيل التصنيفات')} description={copyByLocale(locale, 'Feature flags control which categories may send.', 'تحدد flags أي تصنيفات مسموح بإرسالها.')} />
-              <div className="cluster">
-                {Object.entries(categoryFlags).map(([key, value]) => <Badge key={key} tone={value ? 'success' : 'warning'}>{key}: {boolLabel(value, locale)}</Badge>)}
-              </div>
-            </Card>
-          </div>
-          <Card>
-            <SectionHeader title={copyByLocale(locale, 'Admin test email', 'رسالة اختبار للإدارة')} description={copyByLocale(locale, 'Only catalog events marked as admin-testable can be queued from here.', 'يمكن إرسال الأحداث المسموح باختبارها من الكتالوج فقط.')} />
-            <form className="settings-form" onSubmit={sendTest}>
-              <div className="form-grid">
-                <FormField label={copyByLocale(locale, 'Recipient', 'المستلم')} htmlFor="email-test-recipient" required><Input id="email-test-recipient" type="email" value={recipient} onChange={(event) => setRecipient(event.target.value)} required /></FormField>
-                <FormField label={copyByLocale(locale, 'Template', 'القالب')} htmlFor="email-test-template"><Select id="email-test-template" value={emailType} onChange={(event) => setEmailType(event.target.value)}>{(testableCatalog.length ? testableCatalog : [{ event_type: 'admin.email_test', title_en: 'Admin test email', title_ar: 'رسالة اختبار من الإدارة' } as AdminEmailCatalogItem]).map((item) => <option key={item.event_type} value={item.event_type}>{locale === 'ar' ? item.title_ar : item.title_en}</option>)}</Select></FormField>
-                <FormField label={copyByLocale(locale, 'Language', 'اللغة')} htmlFor="email-test-locale"><Select id="email-test-locale" value={testLocale} onChange={(event) => setTestLocale(event.target.value as 'ar' | 'en')}><option value="ar">العربية</option><option value="en">English</option></Select></FormField>
-              </div>
-              <div className="cluster">
-                <Button type="submit" variant="primary" leadingIcon={<Send size={15} />} loading={busy}>{copyByLocale(locale, 'Queue test', 'إرسال اختبار')}</Button>
-                <Button type="button" onClick={processQueue} loading={busy}>{copyByLocale(locale, 'Process queue', 'معالجة الطابور')}</Button>
-              </div>
-            </form>
-          </Card>
-          {error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}
-          {notice ? <Alert title={t('success')} tone="success">{notice}</Alert> : null}
-          <Tabs ariaLabel={copyByLocale(locale, 'Email sections', 'أقسام البريد')} active={tab} onChange={setTab} items={[
-            { id: 'catalog', label: copyByLocale(locale, 'Catalog', 'الكتالوج') },
-            { id: 'outbox', label: copyByLocale(locale, 'Outbox', 'الطابور') },
-            { id: 'scheduled', label: copyByLocale(locale, 'Scheduled', 'مجدول') },
-            { id: 'inbound', label: copyByLocale(locale, 'Inbound', 'الوارد') },
-            { id: 'events', label: copyByLocale(locale, 'Provider events', 'أحداث المزود') },
-            { id: 'flags', label: copyByLocale(locale, 'Recipient flags', 'حالات المستلمين') },
-          ]} />
-          <div className="admin-tab-panel">
-            {tab === 'catalog' ? <DataTable columns={catalogColumns} rows={catalog} rowKey={(row) => row.event_type} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No catalog events found.', 'لا توجد أحداث بريد.')} /> : null}
-            {tab === 'outbox' ? <DataTable columns={jobColumns} rows={data.jobs} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No queued jobs.', 'لا توجد مهام في الطابور.')} /> : null}
-            {tab === 'scheduled' ? <DataTable columns={scheduledColumns} rows={data.scheduled || []} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No scheduled notifications.', 'لا توجد رسائل مجدولة.')} /> : null}
-            {tab === 'inbound' ? <DataTable columns={inboundColumns} rows={data.inbound} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No inbound emails.', 'لا توجد رسائل واردة.')} /> : null}
-            {tab === 'events' ? <DataTable columns={providerColumns} rows={data.provider_events || []} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No provider events.', 'لا توجد أحداث من المزود.')} /> : null}
-            {tab === 'flags' ? <DataTable columns={flagColumns} rows={data.recipient_flags || []} rowKey={(row) => row.email} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No suppressed recipients.', 'لا توجد حالات حظر للمستلمين.')} /> : null}
-          </div>
-        </>
-      ) : <Card><LoadingBlock label={t('loading')} /></Card>}
-    </>
-  )
-}
-
-function AdminPromos() {
-  const { t, locale } = useExperience()
-  const adapters = useAdapters()
-  const promos = useAsyncData(() => adapters.admin.listPromoCodes(), [adapters])
-  const [open, setOpen] = useState(false)
-  const [code, setCode] = useState('')
-  const [discountType, setDiscountType] = useState<'percent' | 'fixed'>('percent')
-  const [discountValue, setDiscountValue] = useState('')
-  const [maxUses, setMaxUses] = useState('')
-  const [expiry, setExpiry] = useState('')
-  const [preview, setPreview] = useState(false)
-  const [error, setError] = useState('')
-  const maskCode = (value: string) => value.length <= 4 ? '••••' : `${value.slice(0, 2)}••••${value.slice(-2)}`
-  const columns: Column<AdminPromoCode>[] = [{ key: 'code', header: t('promoCodes'), render: (row) => <span className="mono">{maskCode(row.code)}</span> }, { key: 'discount', header: t('details'), render: (row) => row.discount_type === 'percent' ? `${row.discount_value}%` : `$${row.discount_value}` }, { key: 'usage', header: copyByLocale(locale, 'Usage', 'الاستخدام'), render: (row) => `${row.used_count || 0}/${row.max_uses || '∞'}` }, { key: 'expiry', header: t('expiryDate'), render: (row) => row.expires_at ? formatDisplayDate(row.expires_at, locale) : '—' }, { key: 'status', header: t('status'), render: (row) => <Badge tone={row.is_active ? 'success' : 'neutral'}>{row.is_active ? t('enabled') : t('disabled')}</Badge> }, { key: 'action', header: t('actions'), render: (row) => <Button size="sm" onClick={() => adapters.admin.updatePromoCodeState(row.id, !row.is_active, row.is_active ? 'Paused by administrator' : 'Activated by administrator').then(promos.reload)}>{row.is_active ? t('disabled') : t('enabled')}</Button> }]
-  const create = async () => { setError(''); try { await adapters.admin.createPromoCode({ code, discount_type: discountType, discount_value: Number(discountValue), is_private_tier_trigger: false, max_uses: maxUses ? Number(maxUses) : undefined, expires_at: expiry ? new Date(expiry).toISOString() : undefined }); setOpen(false); setPreview(false); setCode(''); setDiscountValue(''); promos.reload() } catch (createError) { setError(createError instanceof Error ? createError.message : 'promo_create_failed') } }
-  return <><PageHeader title={t('promoCodes')} actions={<Button variant="primary" onClick={() => setOpen(true)}>{copyByLocale(locale, 'Create code', 'إنشاء كود')}</Button>} />{promos.error ? <ErrorBlock error={promos.error} onRetry={promos.reload} /> : <DataTable columns={columns} rows={promos.data || []} loading={promos.loading} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No promotion codes exist.', 'لا توجد أكواد عروض.')} />}<Modal open={open} onClose={() => { setOpen(false); setPreview(false) }} title={copyByLocale(locale, 'Create promotion code', 'إنشاء كود عرض')} description={copyByLocale(locale, 'Checkout remains unavailable until a payment provider is connected.', 'الدفع غير متاح حتى يتم ربط مزود دفع.')} closeLabel={t('close')} footer={preview ? <><Button onClick={() => setPreview(false)}>{copyByLocale(locale, 'Back', 'رجوع')}</Button><Button variant="primary" onClick={create}>{copyByLocale(locale, 'Create code', 'إنشاء الكود')}</Button></> : <Button variant="primary" disabled={!code.trim() || !Number(discountValue)} onClick={() => setPreview(true)}>{copyByLocale(locale, 'Review', 'مراجعة')}</Button>}><div className="stack"><div className="form-grid"><FormField label={copyByLocale(locale, 'Code', 'الكود')} required><Input value={code} maxLength={64} onChange={(event) => { setCode(event.target.value.toUpperCase()); setPreview(false) }} /></FormField><FormField label={copyByLocale(locale, 'Benefit type', 'نوع الخصم')}><Select value={discountType} onChange={(event) => { setDiscountType(event.target.value as typeof discountType); setPreview(false) }}><option value="percent">{copyByLocale(locale, 'Percentage', 'نسبة مئوية')}</option><option value="fixed">{copyByLocale(locale, 'Fixed amount', 'قيمة ثابتة')}</option></Select></FormField><FormField label={copyByLocale(locale, 'Benefit value', 'قيمة الخصم')} required><Input type="number" min="0.01" value={discountValue} onChange={(event) => { setDiscountValue(event.target.value); setPreview(false) }} /></FormField><FormField label={copyByLocale(locale, 'Maximum uses', 'الحد الأقصى للاستخدام')}><Input type="number" min="1" value={maxUses} onChange={(event) => { setMaxUses(event.target.value); setPreview(false) }} /></FormField><FormField label={t('expiryDate')}><Input type="datetime-local" value={expiry} onChange={(event) => { setExpiry(event.target.value); setPreview(false) }} /></FormField></div>{preview ? <Alert title={copyByLocale(locale, 'Review the code', 'راجع الكود')} tone="info">{`${maskCode(code)} · ${discountType === 'percent' ? `${discountValue}%` : `$${discountValue}`}`}</Alert> : null}{error ? <Alert title={t('failed')} tone="danger">{error}</Alert> : null}</div></Modal></>
-}
-
-function AdminCommerce() {
-  const { t, locale } = useExperience()
-  const adapters = useAdapters()
-  const overview = useAsyncData(() => adapters.admin.getCommerceOverview(), [adapters])
-  const data = overview.data
-  const planColumns: Column<AdminCommerceOverview['plans'][number]>[] = [
-    { key: 'plan', header: t('plan'), render: (row) => row.display_name || row.plan_id },
-    { key: 'term', header: t('type'), render: (row) => row.term },
-    { key: 'price', header: t('details'), render: (row) => new Intl.NumberFormat(locale === 'ar' ? 'ar-EG' : 'en-US', { style: 'currency', currency: row.currency }).format(row.price_minor / 100) },
-    { key: 'provider', header: t('status'), render: (row) => <Badge tone={row.purchasable ? 'success' : 'warning'}>{row.purchasable ? t('enabled') : row.config_status}</Badge> },
-  ]
-  const orderColumns: Column<AdminCommerceOverview['orders'][number]>[] = [
-    { key: 'id', header: t('details'), render: (row) => row.id.slice(0, 8) },
-    { key: 'plan', header: t('plan'), render: (row) => `${row.plan_id} v${row.plan_version}` },
-    { key: 'status', header: t('status'), render: (row) => <Badge tone={row.status === 'paid' ? 'success' : 'warning'}>{row.status}</Badge> },
-    { key: 'date', header: t('date'), render: (row) => formatDisplayDate(row.created_at, locale) },
-  ]
-  if (overview.loading && !data) return <><PageHeader title={t('payments')} /><SkeletonStack rows={6} /></>
-  return <><PageHeader title={t('payments')} />{overview.error ? <ErrorBlock error={overview.error} onRetry={overview.reload} /> : null}{data ? <div className="stack"><div className="admin-metric-strip"><StatCard label={copyByLocale(locale, 'Checkout', 'الدفع')} value={data.checkout_available ? t('enabled') : t('disabled')} /><StatCard label={copyByLocale(locale, 'Configured providers', 'المزودون المجهزون')} value={Object.values(data.provider_status).filter(Boolean).length} /><StatCard label={t('plans')} value={data.plans.length} /><StatCard label={t('payments')} value={data.orders.length} /></div>{!data.checkout_available ? <Alert title={copyByLocale(locale, 'Checkout unavailable', 'الدفع غير متاح')} tone="info">{copyByLocale(locale, 'No payment provider is configured for a purchasable plan.', 'لا يوجد مزود دفع مجهز لخطة قابلة للشراء.')}</Alert> : null}{data.integrity_events.length ? <Alert title={copyByLocale(locale, 'Subscription integrity review', 'مراجعة سلامة الاشتراكات')} tone="warning">{copyByLocale(locale, `${data.integrity_events.length} unresolved event(s).`, `${data.integrity_events.length} حالة غير محلولة.`)}</Alert> : null}<Card><SectionHeader title={t('plans')} description={data.reconciliation_status} /><DataTable columns={planColumns} rows={data.plans} rowKey={(row) => `${row.plan_id}:${row.version}`} emptyTitle={t('tableEmpty')} emptyBody={t('unavailableMetric')} /></Card><Card><SectionHeader title={t('payments')} /><DataTable columns={orderColumns} rows={data.orders} rowKey={(row) => row.id} emptyTitle={t('tableEmpty')} emptyBody={copyByLocale(locale, 'No provider orders have been created.', 'لا توجد طلبات دفع من مزود حاليًا.')} /></Card><div className="admin-metric-strip"><StatCard label={t('releases')} value={data.releases.length} /><StatCard label={t('downloads')} value={data.download_access_logs.length} /><StatCard label={copyByLocale(locale, 'Integrity alerts', 'تنبيهات السلامة')} value={data.integrity_events.length} /></div></div> : null}</>
-}
 
 export function SystemProductionPages({ page, navigate }: { page: string; navigate: Navigate }) {
   const { t } = useExperience()

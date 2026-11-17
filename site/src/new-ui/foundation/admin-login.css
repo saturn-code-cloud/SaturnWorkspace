@@ -1,6 +1,8 @@
-.admin-login { min-height: 100vh; display: grid; grid-template-rows: 68px 1fr; background: var(--background-subtle); }
-.admin-login > header { display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-.admin-login__card { width: min(calc(100% - 32px), 440px); place-self: center; display: flex; flex-direction: column; gap: var(--space-5); }
+.admin-login { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-rows: auto 1fr; background: var(--background-subtle); }
+.admin-login > header { min-height: 68px; display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; justify-content: space-between; padding: var(--space-3) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
+.admin-login > header > .cluster { flex-wrap: nowrap; margin-inline-start: auto; }
+.admin-login__card { width: min(calc(100% - 32px), 440px); min-width: 0; margin-block: var(--space-6); place-self: center; display: flex; flex-direction: column; gap: var(--space-5); overflow-wrap: anywhere; }
 .admin-login__card h1 { margin: 0; font-size: 1.8rem; }
 .admin-login__card > p { margin: -10px 0 0; color: var(--text-secondary); }
 .admin-login__card > .ui-badge { align-self: flex-start; }
+@media (max-width: 480px) { .admin-login > header { padding-inline: var(--space-4); } }

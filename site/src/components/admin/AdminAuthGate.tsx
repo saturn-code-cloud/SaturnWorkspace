@@ -8,7 +8,7 @@ import {
   signOut,
   type User,
 } from 'firebase/auth'
-import { clearAdminPreauth, fetchAdminPreauthState, fetchAdminSession, setAdminBearerToken, submitAdminPreauth } from '../../api/admin'
+import { clearAdminPreauth, fetchAdminPreauthState, fetchAdminSession, submitAdminPreauth } from '../../api/admin'
 import { firebaseAuth } from '../../lib/firebase'
 import appIcon from '../../assets/saturnws-app-icon.png'
 
@@ -16,8 +16,6 @@ type AdminAuthGateProps = {
   lang: 'en' | 'ar'
   children: ReactNode
 }
-
-const TOKEN_REFRESH_MS = 40 * 60 * 1000
 
 export function AdminAuthGate({ lang, children }: AdminAuthGateProps) {
   const isAr = lang === 'ar'
@@ -77,21 +75,17 @@ export function AdminAuthGate({ lang, children }: AdminAuthGateProps) {
       setUser(nextUser)
       if (nextUser) {
         try {
-          const token = await nextUser.getIdToken()
-          setAdminBearerToken(token)
           setAuthorizing(true)
           setAuthzError(null)
           await fetchAdminSession()
           setIsAuthorized(true)
         } catch (err) {
-          setAdminBearerToken(null)
           setIsAuthorized(false)
           setAuthzError(err instanceof Error ? err.message : labels.accessDenied)
         } finally {
           setAuthorizing(false)
         }
       } else {
-        setAdminBearerToken(null)
         setIsAuthorized(false)
         setAuthzError(null)
       }
@@ -115,16 +109,6 @@ export function AdminAuthGate({ lang, children }: AdminAuthGateProps) {
       alive = false
     }
   }, [])
-
-  useEffect(() => {
-    if (!user) return
-    const timer = window.setInterval(() => {
-      void user.getIdToken(false).then((token) => {
-        setAdminBearerToken(token)
-      })
-    }, TOKEN_REFRESH_MS)
-    return () => window.clearInterval(timer)
-  }, [user])
 
   const handleSignIn = async () => {
     setError(null)
@@ -162,7 +146,6 @@ export function AdminAuthGate({ lang, children }: AdminAuthGateProps) {
       await clearAdminPreauth().catch(() => {
         // Session cookie may already be gone.
       })
-      setAdminBearerToken(null)
       setLayer1Passed(false)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'logout_failed')

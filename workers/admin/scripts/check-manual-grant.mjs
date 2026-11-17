@@ -82,12 +82,17 @@ const profiles = [
   { firebase_uid: 'uid-dupe', normalized_email: 'dupe@example.com', display_name: 'Duplicate user', account_status: 'active', updated_at: iso(-86400e3) },
   { firebase_uid: 'uid-new', normalized_email: 'new@example.com', display_name: 'New user', account_status: 'active', updated_at: iso(-86400e3) },
 ]
+let profileReadFault = null
+let subscriptionReadFault = null
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url)
   const table = url.pathname.split('/').pop()
   const method = String(init.method || 'GET').toUpperCase()
+  if (method === 'HEAD' && table === 'app_sessions') return new Response(null, { headers: { 'Content-Range': '*/0' } })
   if (method === 'GET' && table === 'account_profiles') {
+    if (profileReadFault === 'schema') return Response.json({ message: 'Could not find public.account_profiles in the schema cache' }, { status: 404 })
+    if (profileReadFault === 'shape') return Response.json({ fixture: 'invalid profile list' })
     const query = decodeURIComponent(url.search)
     return Response.json(profiles.filter((profile) =>
       query.includes(profile.firebase_uid) || query.includes(profile.normalized_email),
@@ -95,6 +100,18 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (method === 'GET' && table === 'account_subscriptions') {
     const query = decodeURIComponent(url.search)
+    if (init.headers?.Prefer === 'count=exact' && url.searchParams.has('firebase_user_id')) {
+      assert.equal(url.searchParams.get('order'), 'created_at.desc,id.desc')
+      assert.ok(init.signal instanceof AbortSignal)
+      const uid = url.searchParams.get('firebase_user_id').slice(3)
+      const owned = rows.filter((row) => row.firebase_user_id === uid).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))
+      if (subscriptionReadFault === 'schema') return Response.json({ message: 'fixture database unavailable' }, { status: 404 })
+      if (subscriptionReadFault === 'partial') return Response.json(owned.slice(0, 1), { headers: { 'Content-Range': '0-0/2' } })
+      if (subscriptionReadFault === 'owner') return Response.json([{ ...owned[0], firebase_user_id: 'wrong-owner' }], { headers: { 'Content-Range': '0-0/1' } })
+      return Response.json(owned.slice(0, Number(url.searchParams.get('limit'))), {
+        headers: { 'Content-Range': owned.length ? `0-${Math.min(owned.length, 1000)-1}/${owned.length}` : '*/0' },
+      })
+    }
     if (query.includes('uid-active')) return Response.json(rows.filter((row) => row.firebase_user_id === 'uid-active'))
     if (query.includes('uid-expired')) return Response.json(rows.filter((row) => row.firebase_user_id === 'uid-expired'))
     if (query.includes('uid-dupe')) return Response.json(rows.filter((row) => row.firebase_user_id === 'uid-dupe'))
@@ -120,7 +137,8 @@ globalThis.fetch = async (input, init = {}) => {
     const query = decodeURIComponent(url.search)
     return Response.json(deviceBindings.filter((row) => !query.includes('status=eq.active') || row.status === 'active'))
   }
-  if (method === 'GET' && table === 'account_device_events') return Response.json(deviceEvents)
+  if (method === 'GET' && table === 'account_device_events') return Response.json(deviceEvents.filter((event) =>
+    !url.searchParams.has('details->>request_id') || 'eq.' + event.details.request_id === url.searchParams.get('details->>request_id')))
   if (method === 'GET' && table === 'app_sessions') return Response.json([{ id: 'active-device-session' }])
   if (method === 'GET' && table === 'pending_subscription_grants') {
     const query = decodeURIComponent(url.search)
@@ -168,8 +186,9 @@ globalThis.fetch = async (input, init = {}) => {
     return Response.json([row])
   }
   if (method === 'POST' && table === 'admin_activity') {
-    activity.push(JSON.parse(init.body || '{}'))
-    return Response.json([])
+    const row = JSON.parse(init.body || '{}')
+    activity.push(row)
+    return Response.json([{ id: row.id }], { status: 201 })
   }
   if (method === 'POST' && table === 'subscription_recovery_ledger') {
     const body = JSON.parse(init.body || '{}')
@@ -222,9 +241,12 @@ globalThis.fetch = async (input, init = {}) => {
   if (method === 'POST' && table === 'reset_account_device') {
     const body = JSON.parse(init.body || '{}')
     const active = deviceBindings.find((row) => row.firebase_uid === body.p_firebase_uid && row.status === 'active')
+    assert.equal(active?.id, body.p_expected_binding_id)
+    assert.equal(active?.updated_at, body.p_expected_binding_updated_at)
     if (active) active.status = 'revoked'
-    deviceEvents.push({ id: `device-event-${deviceEvents.length + 1}`, firebase_uid: body.p_firebase_uid, event_type: 'device_binding_reset', details: { request_id: body.p_request_id } })
-    return Response.json(Boolean(active))
+    deviceEvents.push({ id: `device-event-${deviceEvents.length + 1}`, firebase_uid: body.p_firebase_uid, binding_id: active?.id, actor_id: body.p_actor, event_type: 'device_binding_reset', details: { request_id: body.p_request_id, reason: body.p_reason, preview_hash: body.p_preview_hash } })
+    activity.push({ action: 'account_device_binding_reset' })
+    return Response.json({ reset: Boolean(active), idempotent: false })
   }
   if (['orders', 'payment_events', 'invoices'].includes(table || '')) {
     paymentWrites.push({ table, method })
@@ -298,6 +320,26 @@ assert.equal(preview5Days.payload.preview.blocked, false)
 assert.equal(preview5Days.payload.preview.proposed_state.operation, 'extend_current')
 assert.equal(preview5Days.payload.preview.proposed_state.db_plan, 'monthly')
 assert.ok(Date.parse(preview5Days.payload.preview.proposed_state.expires_at) > Date.parse(rows[0].expires_at))
+const originalLength = rows.length
+const historicalRows = Array.from({ length: 1000 }, (_, n) => ({
+  ...rows[0], id: `fixture-history-${n}`, created_at: iso(-3600e3), status: 'expired', expires_at: iso(-1800e3),
+}))
+rows.push(...historicalRows.slice(0, 120))
+const fullHistory = await post('/api/admin/subscriptions/manual-grant/preview', base)
+assert.equal(fullHistory.status, 200)
+assert.equal(fullHistory.payload.preview.history_summary.total_rows, 121)
+assert.equal(fullHistory.payload.preview.current_subscription.id, 'sub-active-1')
+rows.push(...historicalRows.slice(120))
+const beyondLimit = await post('/api/admin/subscriptions/manual-grant/preview', base)
+assert.equal(beyondLimit.status, 503)
+assert.equal(beyondLimit.payload.error, 'manual_grant_subscription_history_unavailable')
+rows.splice(originalLength)
+for (subscriptionReadFault of ['schema', 'partial', 'owner']) {
+  const unavailable = await post('/api/admin/subscriptions/manual-grant/preview', base)
+  assert.equal(unavailable.status, 503)
+  assert.equal(unavailable.payload.error, 'manual_grant_subscription_history_unavailable')
+}
+subscriptionReadFault = null
 
 for (const [value, unit] of [[1, 'hours'], [3, 'weeks'], [2, 'months']]) {
   const result = await post('/api/admin/subscriptions/manual-grant/preview', { ...base, duration_value: value, duration_unit: unit })
@@ -325,6 +367,16 @@ const newUser = await post('/api/admin/subscriptions/manual-grant/preview', {
 })
 assert.equal(newUser.status, 200)
 assert.equal(newUser.payload.preview.current_subscription, null)
+const mismatchedUser = await post('/api/admin/subscriptions/manual-grant/preview', {
+  ...base, target_firebase_uid: 'uid-active', target_email: 'new@example.com',
+})
+assert.equal(mismatchedUser.status, 409)
+assert.equal(mismatchedUser.payload.error, 'manual_grant_target_changed')
+const removedUser = await post('/api/admin/subscriptions/manual-grant/preview', {
+  ...base, target_firebase_uid: 'uid-relocated', target_email: 'waiting@example.com',
+})
+assert.equal(removedUser.status, 409)
+assert.equal(removedUser.payload.error, 'manual_grant_target_changed')
 
 const pendingInput = {
   target_email: 'waiting@example.com',
@@ -336,6 +388,12 @@ const pendingInput = {
   reason_code: 'admin_grant',
   reason: 'Pre-approved subscription before registration',
 }
+for (profileReadFault of ['schema', 'shape']) {
+  const unavailable = await post('/api/admin/subscriptions/manual-grant/preview', pendingInput)
+  assert.equal(unavailable.status, 503)
+  assert.equal(unavailable.payload.error, 'admin_users_unavailable')
+}
+profileReadFault = null
 const pendingPreview = await post('/api/admin/subscriptions/manual-grant/preview', pendingInput)
 assert.equal(pendingPreview.status, 200, JSON.stringify(pendingPreview.payload))
 assert.equal(pendingPreview.payload.preview.pending_registration, true)
@@ -519,10 +577,26 @@ const deviceChangeExecutePayload = {
   preview_hash: deviceChangePreview.payload.preview.preview_hash,
   request_id: 'device-change-operation-001',
 }
+const pendingDeviceRecord = await get('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+assert.equal(pendingDeviceRecord.status, 200)
+assert.equal(pendingDeviceRecord.payload.item.status, 'pending')
+deviceChangeRequests[0].updated_at = iso(1000)
+const staleDeviceDecision = await post('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/execute', deviceChangeExecutePayload)
+assert.equal(staleDeviceDecision.status, 409)
+assert.equal(staleDeviceDecision.payload.error, 'preview_changed')
+assert.equal(deviceChangeRequests[0].status, 'pending')
+const refreshedDevicePreview = await post('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/preview', {
+  action: deviceChangeExecutePayload.action, reason: deviceChangeExecutePayload.reason,
+})
+assert.equal(refreshedDevicePreview.status, 200)
+deviceChangeExecutePayload.preview_hash = refreshedDevicePreview.payload.preview.preview_hash
 const deviceChangeExecute = await post('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/execute', deviceChangeExecutePayload)
 assert.equal(deviceChangeExecute.status, 200, JSON.stringify(deviceChangeExecute.payload))
 assert.equal(deviceChangeExecute.payload.result.item.status, 'approved')
 assert.equal('requested_hwid_hash' in deviceChangeExecute.payload.result.item, false)
+const decidedDeviceRecord = await get('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+assert.equal(decidedDeviceRecord.payload.item.status, 'approved')
+assert.equal(decidedDeviceRecord.payload.item.resolution_note, deviceChangeExecutePayload.reason)
 const deviceChangeReplay = await post('/api/admin/device-change-requests/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/execute', deviceChangeExecutePayload)
 assert.equal(deviceChangeReplay.status, 200)
 assert.equal(deviceChangeReplay.payload.result.idempotent, true)
