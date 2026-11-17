@@ -1,5 +1,5 @@
-import { useRef, useState, type ChangeEvent, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react'
-import { Check, ChevronDown, Eye, EyeOff, Search, X } from 'lucide-react'
+import { useRef, useState, type ChangeEvent, type InputHTMLAttributes, type ReactNode, type Ref, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react'
+import { ChevronDown, Eye, EyeOff, Search, X } from 'lucide-react'
 import { IconButton } from './Button'
 import { useExperience } from '../../app/ExperienceProvider'
 
@@ -30,11 +30,11 @@ export function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
   )
 }
 
-export function SearchInput({ label, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: string }) {
+export function SearchInput({ label, ref, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: string; ref?: Ref<HTMLInputElement> }) {
   return (
     <div className="ui-input-shell ui-search">
       <Search size={16} aria-hidden="true" />
-      <input aria-label={label} className="ui-input" type="search" {...props} />
+      <input ref={ref} aria-label={label} className="ui-input" type="search" {...props} />
     </div>
   )
 }
@@ -43,7 +43,7 @@ export function Textarea({ className = '', ...props }: TextareaHTMLAttributes<HT
   return <textarea className={`ui-input ui-textarea ${className}`} {...props} />
 }
 
-export function Select({ className = '', children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
+export function Select({ className = '', children, ...props }: SelectHTMLAttributes<HTMLSelectElement> & { ref?: Ref<HTMLSelectElement> }) {
   return (
     <div className="ui-select-shell">
       <select className={`ui-input ui-select ${className}`} {...props}>{children}</select>
@@ -67,7 +67,7 @@ export function MultiSelect({ label, options, values, onChange }: { label: strin
             const checked = values.includes(option.value)
             return (
               <button key={option.value} type="button" className="ui-option" disabled={option.disabled} onClick={() => onChange(checked ? values.filter((value) => value !== option.value) : [...values, option.value])}>
-                <span className={`ui-checkmark${checked ? ' is-checked' : ''}`}>{checked ? <Check size={13} /> : null}</span>
+                <span aria-hidden="true" className={`ui-checkmark${checked ? ' is-checked' : ''}`} />
                 <span>{option.label}</span>
               </button>
             )
@@ -79,7 +79,7 @@ export function MultiSelect({ label, options, values, onChange }: { label: strin
 }
 
 export function Checkbox({ label, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: ReactNode }) {
-  return <label className="ui-check"><input type="checkbox" {...props} /><span className="ui-check__box"><Check size={12} /></span><span>{label}</span></label>
+  return <label className="ui-check"><input type="checkbox" {...props} /><span>{label}</span></label>
 }
 
 export function Radio({ label, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: string }) {

@@ -63,7 +63,7 @@ async function mockDiagnosticStore(context, sessions = []) {
     const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
     sessionsByHash.set([...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join(""), session);
   }
-  const store = { rows: new Map(), posts: [], patches: [], beforePatch: null };
+  const store = { rows: new Map(), posts: [], patches: [], beforePatch: null, failGetId: null };
   context.mock.method(globalThis, "fetch", async (input, init) => {
     const url = new URL(String(input));
     assert.equal(url.origin, "https://database.example.test");
@@ -88,7 +88,7 @@ async function mockDiagnosticStore(context, sessions = []) {
     }
     const id = url.searchParams.get("id")?.replace(/^eq\./, "");
     const row = store.rows.get(id);
-    if (init.method === "GET") return respond(row ? [structuredClone(row)] : []);
+    if (init.method === "GET") return id === store.failGetId ? respond({ message: "fixture database unavailable" }, 503) : respond(row ? [structuredClone(row)] : []);
     assert.equal(init.method, "PATCH");
     const incoming = JSON.parse(init.body);
     store.patches.push({ id, incoming, query: url.searchParams });
@@ -147,6 +147,17 @@ test("report detail includes before and linked after evidence without losing red
   assert.equal(result.item.technical_context.trace_followup.events[0].facts.actor, "saturn");
   assert.equal(result.item.technical_context.trace_followup_status, "linked_unattributed");
   assert.doesNotMatch(JSON.stringify(result), /synthetic-secret/);
+  store.failGetId = child.item.id;
+  const partial = await getCrashLog(root.item.id, env);
+  assert.equal(partial.success, true);
+  assert.equal(partial.item.id, root.item.id);
+  assert.equal(partial.item.technical_context.trace.events[0].event, "api.begin");
+  assert.equal(partial.item.technical_context.trace_followup_status, "unavailable");
+  assert.equal(partial.item.technical_context.trace_followup, undefined);
+  assert.doesNotMatch(JSON.stringify(partial), /fixture database unavailable/);
+  store.failGetId = root.item.id;
+  await assert.rejects(getCrashLog(root.item.id, env), /diagnostics_unavailable/);
+  store.failGetId = null;
   store.rows.get(child.item.id).raw_payload.trace.run_id = "00000000-0000-4000-8000-000000000009";
   const mismatch = await getCrashLog(root.item.id, env);
   assert.equal(mismatch.item.technical_context.trace_followup_status, "identity_unverified");
@@ -268,6 +279,13 @@ test("diagnostic request parser rejects invalid and oversized payloads", async (
     })),
     /diagnostic_payload_too_large/,
   );
+  let cancelled = false; let chunk = 0;
+  const streamed = new ReadableStream({ pull(controller) { controller.enqueue(new TextEncoder().encode('ع'.repeat(50000))); if (++chunk === 6) controller.close(); }, cancel() { cancelled = true; } });
+  await assert.rejects(readCrashIngestBody(new Request('https://example.test', { method: 'POST', duplex: 'half', headers: { 'Content-Length': '1' }, body: streamed })), /diagnostic_payload_too_large/);
+  assert.equal(cancelled, true);
+  const bytes = new TextEncoder().encode(JSON.stringify({ message: 'فحص تجريبي' })); let part = 0;
+  const validStream = new ReadableStream({ pull(controller) { if (part >= bytes.length) controller.close(); else { controller.enqueue(bytes.slice(part, part + 1)); part++; } } });
+  assert.equal((await readCrashIngestBody(new Request('https://example.test', { method: 'POST', duplex: 'half', body: validStream }))).message, 'فحص تجريبي');
 });
 
 test("diagnostic rate limit uses a hashed stable key", async () => {

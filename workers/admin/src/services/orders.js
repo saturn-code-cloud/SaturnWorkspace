@@ -25,6 +25,12 @@ function paymentProviderConfigured(env, provider) {
   return false
 }
 
+export function paymentProviderState(env, provider) {
+  const configured = paymentProviderConfigured(env, provider)
+  // No provider execution adapter has been implemented or approved for rollout.
+  return { configured, implemented: false, available: false }
+}
+
 function isPublicVisiblePlan(plan) {
   return Boolean(plan && plan.active && plan.public_visible)
 }
@@ -33,7 +39,7 @@ export function toPublicPlan(plan, env = {}) {
   const currency = String(plan.currency || "USD").toUpperCase()
   const amount = money(plan, "price_minor")
   const original = money(plan, "original_price_minor")
-  const providerReady = paymentProviderConfigured(env, plan.provider)
+  const providerReady = paymentProviderState(env, plan.provider).available
   const checkoutEnabled = isPublicPurchasablePlan(plan) && providerReady
   return {
     id: String(plan.plan_id || ""),

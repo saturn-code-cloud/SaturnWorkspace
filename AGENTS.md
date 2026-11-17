@@ -87,6 +87,24 @@ Do not invent one or disclose the owner's private legal identity.
   tokens, private keys, production payloads, or real user data. Fixture tokens
   must remain unmistakably synthetic and confined to tests.
 
+## UI interaction patterns
+
+Apply this whenever a task adds, changes, or replaces a UI component. Review
+existing components in the affected workflow too, including ones you keep.
+Do not wait for the Product Owner to name a pattern or point out a mismatch.
+
+1. Before editing, define the user's task and compare how working products or
+   their documentation handle it in the same context. Check component galleries
+   for examples, but do not use them as the only evidence. Record the chosen
+   pattern and its references briefly in the working notes or change summary.
+2. Reuse Saturn's components where they support that pattern. Keep placement,
+   keyboard and pointer behavior, copy, and applicable loading, empty, and
+   error states consistent. Explain any departure that affects the workflow.
+3. Exercise the real interaction locally before calling the change complete.
+   Check the relevant states, keyboard and pointer paths, and narrow or
+   right-to-left layouts where applicable. Include the evidence in the existing
+   review or handoff; no separate report is required.
+
 ## Required verification
 
 Run the narrow relevant checks while iterating, then reproduce protected CI:
@@ -116,6 +134,7 @@ Push-Location workers/auth
 npm ci
 npm run check
 npm run test:device-linking
+npm run test:database
 Pop-Location
 
 Push-Location workers/policy

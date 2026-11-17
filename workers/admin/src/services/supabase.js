@@ -40,8 +40,8 @@ export async function supabasePage(env, path, init = {}) {
   const response = await fetch(`${root}${path}`, {
     ...init,
     headers: serviceHeaders(env, {
-      Prefer: "count=exact",
       ...(init.headers || {}),
+      Prefer: "count=exact",
     }),
   })
   const text = await response.text()
@@ -55,10 +55,11 @@ export async function supabasePage(env, path, init = {}) {
     const message = payload && typeof payload === "object" && payload.message ? String(payload.message) : `supabase_${response.status}`
     throw new Error(message)
   }
-  const contentRange = response.headers.get("content-range") || ""
-  const totalText = contentRange.split("/")[1] || "0"
-  const total = totalText === "*" ? null : Number(totalText)
-  return { items: Array.isArray(payload) ? payload : [], total: Number.isFinite(total) ? total : null }
+  const match = /^(?:\d+-\d+|\*)\/(\d+)$/.exec(response.headers.get("Content-Range") || "")
+  const total = match ? Number(match[1]) : NaN
+  if (!Number.isSafeInteger(total)) throw new Error("supabase_exact_count_unavailable")
+  if (init.method !== "HEAD" && !Array.isArray(payload)) throw new Error("invalid_supabase_page")
+  return { items: payload, total }
 }
 
 export function encodeFilterValue(value) {

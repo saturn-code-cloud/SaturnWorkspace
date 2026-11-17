@@ -47,7 +47,7 @@ test("public catalog shows visible plans when the payment provider is unavailabl
   assert.equal(plans[0].localizations.ar.name, "شهري")
 })
 
-test("public catalog enables checkout only when plan and provider are ready", async (t) => {
+test("configured provider credentials do not claim checkout readiness without an execution adapter", async (t) => {
   const originalFetch = globalThis.fetch
   t.after(() => { globalThis.fetch = originalFetch })
   globalThis.fetch = async () => response([{
@@ -64,8 +64,8 @@ test("public catalog enables checkout only when plan and provider are ready", as
   }])
   const plans = await listCommercialPlans({ ...env, STRIPE_SECRET_KEY: "test-only" }, { publicOnly: true })
   assert.equal(plans.length, 1)
-  assert.equal(plans[0].provider_ready, true)
-  assert.equal(plans[0].checkout_enabled, true)
+  assert.equal(plans[0].provider_ready, false)
+  assert.equal(plans[0].checkout_enabled, false)
 })
 
 test("public catalog excludes hidden and inactive plans", async (t) => {

@@ -1,12 +1,13 @@
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { Bell, ChevronDown, Globe2, HelpCircle, LayoutDashboard, LogOut, Menu, Moon, Search, Settings, Sun, X } from 'lucide-react'
 import appIcon from '../assets/saturnws-app-icon.png'
 import { useAdapters } from '../adapters/AdapterProvider'
 import { useExperience } from '../app/ExperienceProvider'
+import { useAdminExitAction } from '../app/adminNavigationProtection'
 import { createAuthRoute, currentInternalLocation } from '../app/navigationIntent'
 import type { AppRoute, Navigate } from '../app/routes'
 import { Button, IconButton } from '../components/ui/Button'
-import { Dropdown, DropdownItem } from '../components/ui/Overlays'
+import { Dropdown, DropdownItem, Modal } from '../components/ui/Overlays'
 import { useAuthState } from '../hooks/useAuthState'
 
 export type { Navigate } from '../app/routes'
@@ -26,13 +27,44 @@ export function ThemeControl() {
   return <div className="theme-toggle" role="group" aria-label={t('theme')}><button type="button" className={theme === 'light' ? 'is-active' : ''} aria-pressed={theme === 'light'} title={t('light')} onClick={() => setTheme('light')}><Sun size={15} /><span className="sr-only">{t('light')}</span></button><button type="button" className={theme === 'dark' ? 'is-active' : ''} aria-pressed={theme === 'dark'} title={t('dark')} onClick={() => setTheme('dark')}><Moon size={15} /><span className="sr-only">{t('dark')}</span></button></div>
 }
 
-export function Topbar({ title, breadcrumbs, onOpenMenu, navigate, admin = false }: { title: string; breadcrumbs?: ReactNode; onOpenMenu?: () => void; navigate: Navigate; admin?: boolean }) {
+export function Topbar({ title, breadcrumbs, onOpenMenu, navigate, admin = false, adminEmail = '', sectionFinder, menuExpanded, menuControls }: { title: string; breadcrumbs?: ReactNode; onOpenMenu?: () => void; navigate: Navigate; admin?: boolean; adminEmail?: string; sectionFinder?: ReactNode; menuExpanded?: boolean; menuControls?: string }) {
   const { t } = useExperience()
+  return <header className="workspace-topbar"><div className="workspace-topbar__identity">{onOpenMenu ? <IconButton className="workspace-topbar__menu" label={t('menu')} aria-expanded={menuExpanded} aria-controls={menuControls} aria-haspopup={menuControls ? 'dialog' : undefined} onClick={onOpenMenu}><Menu size={18} /></IconButton> : null}<div>{breadcrumbs}<strong>{title}</strong></div></div><div className="workspace-topbar__tools">{sectionFinder || <><label className="topbar-search"><Search size={15} /><input aria-label={t('search')} placeholder={t('search')} /></label><IconButton label={t('notifications')} onClick={() => !admin && navigate({ surface: 'portal', page: 'notifications' })}><Bell size={17} /></IconButton><IconButton label={t('support')} onClick={() => navigate({ surface: admin ? 'admin' : 'portal', page: 'support' })}><HelpCircle size={17} /></IconButton></>}<LocaleControl /><ThemeControl />{admin ? <TopbarAccount admin email={adminEmail} navigate={navigate} /> : <PortalTopbarAccount navigate={navigate} />}</div></header>
+}
+
+function TopbarAccount({ navigate, admin = false, email = '', displayName }: { navigate: Navigate; admin?: boolean; email?: string; displayName?: string }) {
+  const { t, locale } = useExperience()
   const { auth } = useAdapters()
-  const { user } = useAuthState()
-  const email = user?.email || ''
+  const confirmExit = useAdminExitAction()
+  const signingOut = useRef(false)
+  const [signOutFailed, setSignOutFailed] = useState(false)
   const initial = email.slice(0, 1).toUpperCase() || (admin ? 'A' : 'S')
-  return <header className="workspace-topbar"><div className="workspace-topbar__identity">{onOpenMenu ? <IconButton className="workspace-topbar__menu" label={t('menu')} onClick={onOpenMenu}><Menu size={18} /></IconButton> : null}<div>{breadcrumbs}<strong>{title}</strong></div></div><div className="workspace-topbar__tools"><label className="topbar-search"><Search size={15} /><input aria-label={t('search')} placeholder={t('search')} /></label><IconButton label={t('notifications')} onClick={() => !admin && navigate({ surface: 'portal', page: 'notifications' })}><Bell size={17} /></IconButton><IconButton label={t('support')} onClick={() => navigate({ surface: admin ? 'admin' : 'portal', page: 'support' })}><HelpCircle size={17} /></IconButton><LocaleControl /><ThemeControl /><Dropdown label={t('account')} trigger={<span className="account-trigger"><span>{initial}</span><div><strong>{user?.displayName || (admin ? t('adminConsole') : t('account'))}</strong><small>{email}</small></div><ChevronDown size={14} /></span>}><DropdownItem onClick={() => navigate({ surface: admin ? 'admin' : 'portal', page: 'overview' })}><LayoutDashboard size={15} />{admin ? t('adminConsole') : t('account')}</DropdownItem><DropdownItem onClick={() => { void auth.signOut().finally(() => navigate({ surface: 'public', page: 'home' })) }}><LogOut size={15} />{t('signOut')}</DropdownItem></Dropdown></div></header>
+  const runSignOut = async () => {
+    if (signingOut.current) return
+    signingOut.current = true
+    setSignOutFailed(false)
+    try {
+      await auth.signOut()
+      if (!admin) navigate({ surface: 'public', page: 'home' })
+    } catch {
+      setSignOutFailed(true)
+    } finally {
+      signingOut.current = false
+    }
+  }
+  const signOut = () => confirmExit(() => { void runSignOut() })
+  return <>
+    <Dropdown label={t('account')} trigger={<span className="account-trigger"><span>{initial}</span><div><strong>{displayName || (admin ? t('adminConsole') : t('account'))}</strong><small>{email}</small></div><ChevronDown size={14} /></span>}><DropdownItem onClick={() => navigate({ surface: admin ? 'admin' : 'portal', page: 'overview' })}><LayoutDashboard size={15} />{admin ? t('adminConsole') : t('account')}</DropdownItem><DropdownItem onClick={signOut}><LogOut size={15} />{t('signOut')}</DropdownItem></Dropdown>
+    {signOutFailed ? <Modal open size="sm" title={locale === 'ar' ? 'تعذّر تسجيل الخروج' : 'Could not sign out'} closeLabel={t('close')} onClose={() => setSignOutFailed(false)}
+      footer={<Button type="button" onClick={() => setSignOutFailed(false)}>{t('close')}</Button>}>
+      <p>{locale === 'ar' ? 'يمكنك المحاولة مرة أخرى من قائمة الحساب.' : 'Try again from the account menu.'}</p>
+    </Modal> : null}
+  </>
+}
+
+function PortalTopbarAccount({ navigate }: { navigate: Navigate }) {
+  const { user } = useAuthState()
+  return <TopbarAccount navigate={navigate} email={user?.email} displayName={user?.displayName || undefined} />
 }
 
 export function PublicHeader({ navigate }: { navigate: Navigate }) {

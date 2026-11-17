@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { createHash, createHmac } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { build } from 'esbuild'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build, transform } from 'esbuild'
 import { Miniflare } from 'miniflare'
 import { cloudflareWorkersTestShim } from './esbuild-cloudflare-test-shim.mjs'
 
@@ -24,6 +24,7 @@ let failReceiveOnce = true
 let failSend = false
 let authUnavailable = false
 let authThrows = false
+const sendRequests = []
 
 await build({
   entryPoints: [path.join(root, 'src', 'index.ts')],
@@ -77,6 +78,7 @@ const mf = new Miniflare({
       const url = new URL(request.url)
       if (request.method === 'POST' && url.pathname === '/emails') {
         const input = await request.json().catch(() => ({}))
+        sendRequests.push(input)
         if (failSend || String(input.to || '').includes('send-fail')) return Response.json({ message: 'provider unavailable' }, { status: 503 })
         return Response.json({ id: `provider-${createHash('sha1').update(String(input.subject || Date.now())).digest('hex').slice(0, 12)}` })
       }
@@ -92,13 +94,90 @@ const mf = new Miniflare({
 })
 
 try {
+  const activityBundle = path.join(temp, 'email-activity.mjs')
+  await build({ entryPoints: [path.join(root, 'src/email_activity.ts')], bundle: true, format: 'esm', platform: 'browser', target: 'es2022', outfile: activityBundle, logLevel: 'silent' })
+  const { EMAIL_PAYLOAD_STATE_SQL, readEmailActivity, readEmailJob, emailJobRetryReason } = await import(pathToFileURL(activityBundle).href)
+  for (const result of [{ success: false, results: [] }, { success: true, results: null }, { success: true }]) {
+    const brokenDb = { prepare() { return { bind() { return this }, async all() { return result } } } }
+    await assert.rejects(readEmailActivity(new URL('https://fixture.invalid/?view=outbound'), brokenDb), /email_activity_unavailable/)
+    await assert.rejects(readEmailJob(brokenDb, 'fixture-id'), /email_activity_unavailable/)
+  }
+  const partialDb = { prepare(sql) { return { bind() { return this }, async all() {
+    if (sql.includes('FROM email_events')) throw new Error('fixture-private-events-failure')
+    return { success: true, results: [{ id: 'fixture-id', status: 'failed', email_type: 'admin.email_test' }] }
+  } } } }
+  const partialJob = await readEmailJob(partialDb, 'fixture-id')
+  assert.equal(partialJob.job.id, 'fixture-id')
+  assert.equal(partialJob.events_unavailable, true)
+  assert.equal(partialJob.events_has_more, false)
+  assert.doesNotMatch(JSON.stringify(partialJob), /fixture-private/)
+  assert.equal(emailJobRetryReason({ status: 'failed', email_type: 'support.inbound_received' }), 'email_job_retry_not_allowed')
+  assert.equal(emailJobRetryReason({ status: 'failed', email_type: 'admin.email_test', sensitive_payload_state: 'purged' }), 'sensitive_payload_unavailable')
+  assert.equal(emailJobRetryReason({ status: 'failed', email_type: 'admin.email_test' }, 'suppressed'), 'recipient_suppressed')
+  console.log('PASS Email activity rejects failed and malformed reads; auxiliary event failure preserves the selected job')
+  const policySource = await readFile(path.join(root, 'src/index.ts'), 'utf8')
+  const supportHandler = policySource.slice(policySource.indexOf('async function handleAdminSupportMessages('), policySource.indexOf('async function handleAdminSupportAttachment('))
+  const compiledSupportHandler = await transform(supportHandler, { loader: 'ts', target: 'es2022' })
+  const readConversation = new Function('normalizeText', 'supportBlockMatchSql', 'loadMessageAttachments', 'normalizeSupportThread', 'normalizeSupportMessage', 'json', 'console', compiledSupportHandler.code + '\nreturn handleAdminSupportMessages;')(
+    (value) => String(value || '').trim(), () => '1 = 1', async () => new Map(), (value) => value, (value) => value,
+    (value) => Response.json(value), { warn() {} },
+  )
+  let readMode = 'ok'
+  let readMarkers = 0
+  const failureEnv = { DB: { prepare(sql) { return { bind() { return this },
+    async first() { return { id: 'fixture-thread', subject: 'Fixture' } },
+    async all() {
+      if (sql.includes('support_messages')) {
+        if (readMode === 'messages-failed') return { success: false }
+        if (readMode === 'messages-malformed') return { success: true, results: null }
+        return { success: true, results: [{ id: 'fixture-message', thread_id: 'fixture-thread', sender: 'user', body: 'Fixture message', admin_unread: 1 }] }
+      }
+      if (readMode === 'audit-threw') throw new Error('private_fixture_database_failure')
+      return readMode === 'audit-failed' ? { success: false } : { success: true, results: [] }
+    },
+    async run() { readMarkers++; if (readMode === 'marker-threw') throw new Error('private_fixture_marker_failure'); return { success: true } },
+  } } } }
+  const conversationRequest = new Request('https://fixture.invalid/v1/admin/support/messages?thread_id=fixture-thread')
+  for (const mode of ['ok', 'audit-failed', 'audit-threw', 'marker-threw']) {
+    readMode = mode
+    const result = await (await readConversation(conversationRequest, failureEnv)).json()
+    assert.equal(result.messages[0].body, 'Fixture message')
+    assert.equal(result.audit_unavailable, mode.startsWith('audit-'))
+    assert.ok(!JSON.stringify(result).includes('private_fixture'))
+  }
+  for (const mode of ['messages-failed', 'messages-malformed']) {
+    readMode = mode
+    const before = readMarkers
+    await assert.rejects(readConversation(conversationRequest, failureEnv), /support_inbox_unavailable/)
+    assert.equal(readMarkers, before, 'Failed conversation reads must not mark the ticket read')
+  }
+  console.log('PASS Support conversation reads preserve messages when auxiliary history or read markers fail; malformed messages fail explicitly')
   const db = await mf.getD1Database('DB')
   const migrationDir = path.join(root, 'migrations')
   for (const name of (await readdir(migrationDir)).filter((name) => name.endsWith('.sql')).sort()) {
+    const supportReceiptsMigration = name === '0019_support_admin_history_and_reads.sql'
+    if (supportReceiptsMigration) {
+      await db.exec("INSERT INTO support_threads (id, subject, status, admin_last_read_at) VALUES ('fixture-receipt-migration', 'Receipt migration fixture', 'closed', '2026-11-01 12:00:00');")
+      await db.exec(`INSERT INTO support_messages (id, thread_id, sender, sender_role, body, created_at) VALUES
+        ('fixture-before-marker', 'fixture-receipt-migration', 'user', 'customer', 'fixture', '2026-11-01 11:59:59'),
+        ('fixture-at-marker', 'fixture-receipt-migration', 'user', 'email_inbound', 'fixture', '2026-11-01 12:00:00'),
+        ('fixture-after-marker', 'fixture-receipt-migration', 'user', 'customer', 'fixture', '2026-11-01 12:00:01'),
+        ('fixture-note-before-marker', 'fixture-receipt-migration', 'admin', 'internal_note', 'fixture', '2026-11-01 11:59:59');`.replace(/\r?\n/g, ' '))
+    }
     const sql = (await readFile(path.join(migrationDir, name), 'utf8'))
       .replace(/^\s*--.*$/gm, '')
       .replace(/\r?\n/g, ' ')
     await db.exec(sql)
+    if (supportReceiptsMigration) {
+      const { results } = await db.prepare("SELECT id, admin_read_at FROM support_messages WHERE thread_id = 'fixture-receipt-migration' ORDER BY id").all()
+      assert.deepEqual(results.map(({ id, admin_read_at: read }) => [id, read]), [
+        ['fixture-after-marker', null],
+        ['fixture-at-marker', '2026-11-01 12:00:00'],
+        ['fixture-before-marker', '2026-11-01 12:00:00'],
+        ['fixture-note-before-marker', null],
+      ])
+      await db.exec("DELETE FROM support_threads WHERE id = 'fixture-receipt-migration';")
+    }
   }
 
   const post = async (pathname, body, token = 'token-a', headers = {}) => {
@@ -329,9 +408,52 @@ try {
   await adminPost('/v1/admin/email/process', {})
   failedJob = await db.prepare('SELECT status FROM email_jobs WHERE id = ?1').bind(failedJobId).first()
   assert.equal(failedJob.status, 'failed')
+  await db.prepare(`INSERT INTO email_jobs (id, idempotency_key, email_type, recipient, sender, subject, html_body, status, created_at)
+    VALUES ('fixture-other-queued-job', 'fixture-other-queued-job', 'admin.email_test', 'other-queued@example.test', 'fixture@example.test', 'Other queued message', '<p>Fixture</p>', 'queued', '2026-01-01 00:00:00')`).run()
   const retriedJob = await adminPost('/v1/admin/email/retry', { job_id: failedJobId })
   assert.equal(retriedJob.response.status, 200)
+  assert.equal(retriedJob.body.job_id, failedJobId)
+  assert.equal(retriedJob.body.processed.processed, 1)
+  assert.equal(retriedJob.body.processed.sent, 0)
   assert.equal((await db.prepare('SELECT status FROM email_jobs WHERE id = ?1').bind(failedJobId).first()).status, 'queued')
+  assert.equal((await db.prepare("SELECT status FROM email_jobs WHERE id = 'fixture-other-queued-job'").first()).status, 'queued', 'A retry must not process an unrelated queued email')
+  assert.equal((await adminPost('/v1/admin/email/retry', { job_id: failedJobId })).response.status, 409)
+  const directedTest = await adminPost('/v1/admin/email/test', { recipient: 'directed-test@example.test', email_type: 'admin.email_test', message: 'Directed fixture' })
+  assert.equal(directedTest.body.processed.sent, 1)
+  assert.equal((await db.prepare('SELECT status FROM email_jobs WHERE id = ?1').bind(directedTest.body.job_id).first()).status, 'sent')
+  assert.equal((await db.prepare("SELECT status FROM email_jobs WHERE id = 'fixture-other-queued-job'").first()).status, 'queued', 'Sending a test must not process an unrelated queued email')
+  await db.prepare(`INSERT INTO email_jobs (id, idempotency_key, email_type, recipient, sender, subject, html_body, status)
+    VALUES ('fixture-concurrent-retry', 'fixture-concurrent-retry', 'admin.email_test', 'concurrent-retry@example.test', 'fixture@example.test', 'Concurrent retry', '<p>Fixture</p>', 'failed')`).run()
+  const beforeConcurrent = sendRequests.filter((input) => input.to?.includes('concurrent-retry@example.test')).length
+  const concurrentRetries = await Promise.all([adminPost('/v1/admin/email/retry', { job_id: 'fixture-concurrent-retry' }), adminPost('/v1/admin/email/retry', { job_id: 'fixture-concurrent-retry' })])
+  assert.deepEqual(concurrentRetries.map((result) => result.response.status).sort(), [200, 409])
+  assert.equal(sendRequests.filter((input) => input.to?.includes('concurrent-retry@example.test')).length, beforeConcurrent + 1)
+  assert.equal((await db.prepare("SELECT status FROM email_jobs WHERE id = 'fixture-other-queued-job'").first()).status, 'queued')
+  await db.prepare(`INSERT INTO email_jobs (id, idempotency_key, email_type, recipient, sender, subject, status)
+    VALUES ('fixture-racing-suppression', 'fixture-racing-suppression', 'admin.email_test', 'racing-suppression@example.test', 'fixture@example.test', 'Racing suppression', 'failed')`).run()
+  const retryHandlerSource = policySource.slice(policySource.indexOf('async function handleAdminEmailRetry('), policySource.indexOf('async function handleAdminEmailTest('))
+  const retryHandlerCode = (await transform(retryHandlerSource, { loader: 'ts', target: 'es2022' })).code
+  const forbiddenRetrySideEffect = () => assert.fail('A job changed during review must not be sent or audited as retried')
+  const retryHandler = new Function('normalizeText', 'normalizeEmailAddress', 'EMAIL_PAYLOAD_STATE_SQL', 'emailJobRetryReason', 'dbChanges', 'updatePortalNotificationEmailStatus', 'auditSupportEvent', 'processEmailJobImmediately', 'json', retryHandlerCode + '; return handleAdminEmailRetry;')(
+    (value) => String(value || '').trim(), (value) => String(value || '').trim().toLowerCase(), EMAIL_PAYLOAD_STATE_SQL, emailJobRetryReason,
+    (result) => result?.meta?.changes || 0, forbiddenRetrySideEffect, forbiddenRetrySideEffect, forbiddenRetrySideEffect,
+    (body, status = 200) => Response.json(body, { status }),
+  )
+  const racingDb = { prepare(sql) { return { bind(...values) {
+    const statement = db.prepare(sql).bind(...values)
+    return { async first() {
+      const result = await statement.first()
+      if (sql.startsWith('SELECT status FROM email_recipient_flags')) {
+        await db.prepare("INSERT INTO email_recipient_flags (email, status) VALUES ('racing-suppression@example.test', 'suppressed')").run()
+      }
+      return result
+    }, run() { return statement.run() } }
+  } } } }
+  const suppressedDuringReview = await retryHandler(new Request('https://fixture.invalid', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: 'fixture-racing-suppression' }) }), { DB: racingDb })
+  assert.equal(suppressedDuringReview.status, 409)
+  assert.equal((await suppressedDuringReview.json()).error, 'email_job_changed')
+  assert.equal((await db.prepare("SELECT status FROM email_jobs WHERE id = 'fixture-racing-suppression'").first()).status, 'failed')
+  await db.prepare("DELETE FROM email_jobs WHERE id = 'fixture-other-queued-job'").run()
 
   const bounceTest = await adminPost('/v1/admin/email/test', { recipient: 'bounce@example.test', email_type: 'admin.email_test', message: 'Bounce path' })
   const bounceJob = await db.prepare('SELECT provider_message_id FROM email_jobs WHERE id = ?1').bind(bounceTest.body.job_id).first()
@@ -342,6 +464,13 @@ try {
   const bounceResponse = await mf.dispatchFetch('https://api.saturnws.com/api/webhooks/resend', { method: 'POST', headers: { 'svix-id': bounceEventId, 'svix-timestamp': bounceTimestamp, 'svix-signature': `v1,${bounceSignature}` }, body: bouncePayload })
   assert.equal(bounceResponse.status, 200)
   assert.equal((await db.prepare("SELECT status FROM email_recipient_flags WHERE email = 'bounce@example.test'").first()).status, 'bounced')
+  const suppressedRetry = await adminPost('/v1/admin/email/retry', { job_id: bounceTest.body.job_id })
+  assert.equal(suppressedRetry.response.status, 409)
+  assert.equal(suppressedRetry.body.error, 'recipient_suppressed')
+  await db.prepare("UPDATE email_jobs SET status = 'failed' WHERE id = ?1").bind(authEnqueueBody.job_id).run()
+  const purgedRetry = await adminPost('/v1/admin/email/retry', { job_id: authEnqueueBody.job_id })
+  assert.equal(purgedRetry.response.status, 409)
+  assert.equal(purgedRetry.body.error, 'sensitive_payload_unavailable')
   const duplicateBounce = await mf.dispatchFetch('https://api.saturnws.com/api/webhooks/resend', { method: 'POST', headers: { 'svix-id': bounceEventId, 'svix-timestamp': bounceTimestamp, 'svix-signature': `v1,${bounceSignature}` }, body: bouncePayload })
   assert.equal((await duplicateBounce.json()).duplicate, true)
   await adminPost('/v1/admin/email/test', { recipient: 'bounce@example.test', email_type: 'admin.email_test', message: 'Suppressed path' })
@@ -352,7 +481,201 @@ try {
   assert.ok(audit.body.audit.some((event) => event.event_type === 'support_reply'))
   assert.ok(audit.body.audit.some((event) => event.event_type === 'inbound_email_processed'))
 
-  console.log('Support, notification, webhook, idempotency, ownership, rate-limit, and lock checks passed.')
+  const insertInboxThread = db.prepare(`INSERT INTO support_threads
+    (id, email, subject, status, priority, created_at, updated_at)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)`)
+  await db.batch(Array.from({ length: 101 }, (_, index) => insertInboxThread.bind(
+    `fixture-closed-${index}`, 'archive@example.test', 'Archived', 'closed', 'urgent', '2026-11-01 12:00:00',
+  )))
+  await db.batch([
+    insertInboxThread.bind('fixture-inbox-first', 'first@example.test', 'Inbox unique 100%_ old', 'waiting_for_support', 'urgent', '2026-10-01 12:00:00'),
+    insertInboxThread.bind('fixture-inbox-second', 'second@example.test', 'Inbox unique next', 'reopened', 'urgent', '2026-10-02 12:00:00'),
+    insertInboxThread.bind('fixture-inbox-third', 'third@example.test', 'Inbox unique newest', 'open', 'normal', '2026-10-03 12:00:00'),
+    insertInboxThread.bind('fixture-inbox-blocked', 'inbox-blocked@example.test', 'Inbox unique blocked', 'awaiting_support', 'urgent', '2026-09-01 12:00:00'),
+  ])
+  await db.prepare("INSERT INTO support_message_blocks (id, email) VALUES ('fixture-inbox-block', 'inbox-blocked@example.test')").run()
+  const inbox = '/v1/admin/support?view=inbox'
+  const unauthenticatedInbox = await mf.dispatchFetch(`https://api.saturnws.com${inbox}`)
+  assert.equal(unauthenticatedInbox.status, 401)
+  const legacyInbox = await adminGet('/v1/admin/support')
+  assert(!legacyInbox.body.threads.some((thread) => thread.id === 'fixture-inbox-first'))
+  const firstInboxPage = await adminGet(`${inbox}&scope=waiting&priority=urgent&query=Inbox%20unique&limit=1`)
+  assert.equal(firstInboxPage.response.status, 200)
+  assert.equal(firstInboxPage.body.has_more, true)
+  assert.deepEqual(firstInboxPage.body.threads.map((thread) => thread.id), ['fixture-inbox-first'])
+  const lastInboxPage = await adminGet(`${inbox}&scope=waiting&priority=urgent&query=Inbox%20unique&limit=1&page=2`)
+  assert.equal(lastInboxPage.body.has_more, false)
+  assert.deepEqual(lastInboxPage.body.threads.map((thread) => thread.id), ['fixture-inbox-second'])
+  const blockedInbox = await adminGet(`${inbox}&status=blocked&query=Inbox%20unique`)
+  assert.deepEqual(blockedInbox.body.threads.map((thread) => [thread.id, thread.status]), [['fixture-inbox-blocked', 'blocked']])
+  const literalInboxSearch = await adminGet(`${inbox}&status=awaiting_support&query=${encodeURIComponent('100%_')}`)
+  assert.deepEqual(literalInboxSearch.body.threads.map((thread) => thread.id), ['fixture-inbox-first'])
+  const ticketId = 'fixture-inbox-first'
+  let legacyTicketHash = 0
+  for (const character of ticketId) legacyTicketHash = (legacyTicketHash * 31 + character.charCodeAt(0)) >>> 0
+  const legacyTicketReference = `SAT-2026-${String(legacyTicketHash % 1000000).padStart(6, '0')}`
+  const emailTicketReference = `SAT-2026-${ticketId.replaceAll('-', '').slice(-6).toUpperCase()}`
+  await db.prepare("UPDATE support_threads SET updated_at = '2027-01-01 12:00:00' WHERE id = ?1").bind(ticketId).run()
+  for (const reference of [legacyTicketReference, emailTicketReference, legacyTicketReference.replace('2026', '2027')]) {
+    const matching = await adminGet(`${inbox}&query=${encodeURIComponent(reference)}`)
+    assert.equal(matching.response.status, 200)
+    assert.deepEqual(matching.body.threads.map((thread) => thread.id), [ticketId])
+  }
+  const inboxLookup = await adminGet(`${inbox}&thread_id=fixture-inbox-first`)
+  assert.equal(inboxLookup.body.threads[0].status, 'awaiting_support')
+  assert.equal((await db.prepare("SELECT admin_last_read_at FROM support_threads WHERE id = 'fixture-inbox-first'").first()).admin_last_read_at, null)
+  assert.equal((await adminGet(`${inbox}&thread_id=fixture-not-found`)).response.status, 404)
+  assert.equal((await adminGet(`${inbox}&priority=invalid`)).response.status, 400)
+  assert.equal((await adminGet(`${inbox}&limit=51`)).response.status, 400)
+  const insertMessage = db.prepare(`INSERT INTO support_messages
+    (id, thread_id, sender, sender_role, body, created_at)
+    VALUES (?1, ?2, ?3, ?4, 'Fixture', '2026-11-01 12:00:00')`)
+  await db.batch([
+    insertMessage.bind('fixture-first-customer', ticketId, 'user', 'customer'),
+    insertMessage.bind('fixture-first-note', ticketId, 'admin', 'internal_note'),
+    insertMessage.bind('fixture-second-customer', 'fixture-inbox-second', 'user', 'customer'),
+  ])
+  const supportRead = '/v1/admin/support/read'
+  const readStatus = async (id) => (await db.prepare('SELECT admin_read_at FROM support_messages WHERE id = ?1').bind(id).first()).admin_read_at
+  const unreadAt = async (id) => (await adminGet(`${inbox}&thread_id=${id}`)).body.threads[0].unread_count
+  const conversation = await adminGet(`/v1/admin/support/conversation?thread_id=${ticketId}`)
+  assert.equal(conversation.response.status, 200)
+  assert.equal(conversation.body.thread.id, ticketId)
+  assert.deepEqual(conversation.body.unread_message_ids, ['fixture-first-customer'])
+  assert.equal(conversation.body.audit, undefined)
+  assert.equal(await readStatus('fixture-first-customer'), null)
+  await insertMessage.bind('fixture-first-late', ticketId, 'user', 'email_inbound').run()
+  assert.equal(await unreadAt(ticketId), 2)
+  const receipt = { thread_id: ticketId, message_ids: [...conversation.body.unread_message_ids, 'fixture-first-note', 'fixture-second-customer'] }
+  assert.equal((await mf.dispatchFetch(`https://api.saturnws.com${supportRead}`, { method: 'POST', body: JSON.stringify(receipt) })).status, 401)
+  assert.equal((await adminPost(supportRead, { ...receipt, message_ids: [true] })).response.status, 400)
+  assert.equal((await adminPost(supportRead, { ...receipt, message_ids: Array(101).fill('fixture-first-late') })).response.status, 400)
+  assert.equal((await adminPost(supportRead, { ...receipt, thread_id: 'fixture-missing' })).response.status, 404)
+  assert.equal((await adminPost(supportRead, receipt)).response.status, 200)
+  const marked = await readStatus('fixture-first-customer')
+  assert.ok(marked)
+  assert.equal((await adminPost(supportRead, receipt)).response.status, 200)
+  assert.equal(await readStatus('fixture-first-customer'), marked)
+  assert.equal(await readStatus('fixture-first-note'), null)
+  assert.equal(await readStatus('fixture-second-customer'), null)
+  assert.equal(await readStatus('fixture-first-late'), null)
+  assert.equal(await unreadAt(ticketId), 1)
+
+  const insertEvent = db.prepare(`INSERT INTO support_audit_events (id, thread_id, event_type, actor_role, created_at)
+    VALUES (?1, ?2, 'priority_changed', 'admin', ?3)`)
+  const historyIds = Array.from({ length: 231 }, (_, index) => `fixture-history-${String(index).padStart(3, '0')}`)
+  await db.batch(historyIds.map((id) => insertEvent.bind(id, ticketId, '2026-11-01 12:00:00')))
+  const history = `/v1/admin/support/history?thread_id=${ticketId}`
+  assert.equal((await mf.dispatchFetch(`https://api.saturnws.com${history}`)).status, 401)
+  assert.equal((await adminGet('/v1/admin/support/history?thread_id=fixture-missing')).response.status, 404)
+  assert.equal((await adminGet('/v1/admin/support/history?thread_id=fixture-inbox-second&cursor=fixture-history-230')).response.status, 400)
+  let next = null
+  const seenHistory = []
+  for (let page = 0; page < 10; page++) {
+    const result = await adminGet(history + (next ? `&cursor=${next}` : ''))
+    assert.equal(result.response.status, 200)
+    assert.equal(result.body.thread_id, ticketId)
+    assert.equal(result.body.events.length, page === 9 ? 6 : 25)
+    assert.deepEqual(Object.keys(result.body.events[0]).sort(), ['actor_role', 'created_at', 'event_type', 'id'])
+    seenHistory.push(...result.body.events.map(({ id }) => id))
+    next = result.body.next_cursor
+    if (page === 0) await insertEvent.bind('fixture-history-232', ticketId, '2026-11-01T12:00:00.100Z').run()
+  }
+  assert.equal(next, null)
+  assert.deepEqual(seenHistory, [...historyIds].reverse())
+  assert.equal((await adminGet(history)).body.events[0].id, 'fixture-history-232')
+  assert.equal(await unreadAt(ticketId), 1, 'History never changes read status')
+  const noteResult = await adminPost('/v1/admin/support/reply', { thread_id: ticketId, body: 'Fixture note', internal_note: true, idempotency_key: 'fixture-unread-note' })
+  assert.equal(noteResult.response.status, 200)
+  assert.equal(await unreadAt(ticketId), 1, 'A note must not clear unseen messages')
+  const legacyConversation = await adminGet(`/v1/admin/support/messages?thread_id=${ticketId}`)
+  assert.equal(legacyConversation.body.audit.length, 200)
+  assert.equal(typeof legacyConversation.body.audit.at(-1).metadata_json, 'string')
+  assert.equal(legacyConversation.body.audit.at(-1).event_type, 'internal_note_added')
+  assert.ok(legacyConversation.body.audit.some(({ id }) => id === 'fixture-history-232'))
+  assert.ok(await readStatus('fixture-first-late'), 'The old client still acknowledges only the returned messages')
+  assert.equal(await unreadAt(ticketId), 0)
+  console.log('PASS Support exact read receipts, same-second arrivals, cross-ticket isolation, old-client compatibility, and 231-event history pagination during concurrent insertion')
+  const logInsert = db.prepare(`INSERT INTO email_jobs
+    (id, idempotency_key, email_type, recipient, sender, subject, status, html_body, text_body, template_data_json, headers_json, sensitive_payload_ciphertext, created_at)
+    VALUES (?1, ?1, 'admin.email_test', 'fixture-log@example.test', 'fixture@example.test', ?2, ?3, 'fixture-private-html', 'fixture-private-text', 'fixture-private-template', 'fixture-private-header', 'fixture-private-ciphertext', '2026-01-01 00:00:00')`)
+  await db.batch(Array.from({ length: 130 }, (_, index) => logInsert.bind(`fixture-log-${String(index).padStart(3, '0')}`, index === 0 ? 'Literal 100%_ fixture' : 'Fixture log', index % 2 ? 'failed' : 'sent')))
+  const activityPath = '/v1/admin/email/activity?view=outbound&query=fixture-log'
+  assert.equal((await mf.dispatchFetch(`https://api.saturnws.com${activityPath}`)).status, 401)
+  const activityIds = []
+  for (let page = 1; page <= 6; page++) {
+    const result = await adminGet(`${activityPath}&page=${page}`)
+    assert.equal(result.response.status, 200)
+    assert.equal(result.body.page, page)
+    assert.equal(result.body.has_more, page < 6)
+    assert.equal(result.body.items.length, page < 6 ? 25 : 5)
+    assert.doesNotMatch(JSON.stringify(result.body), /fixture-private|html_body|headers_json|sensitive_payload_ciphertext/)
+    activityIds.push(...result.body.items.map((item) => item.id))
+  }
+  assert.equal(new Set(activityIds).size, 130)
+  assert.equal(activityIds[0], 'fixture-log-129')
+  const filteredActivity = await adminGet(`${activityPath}&status=failed&limit=100`)
+  assert.equal(filteredActivity.body.items.length, 65)
+  assert.ok(filteredActivity.body.items.every((item) => item.status === 'failed'))
+  const literalActivity = await adminGet(`/v1/admin/email/activity?view=outbound&query=${encodeURIComponent('100%_')}`)
+  assert.deepEqual(literalActivity.body.items.map((item) => item.id), ['fixture-log-000'])
+  for (const query of ['view=invalid', 'view=__proto__', 'limit=101', 'limit=-1', 'limit=0', 'page=1.5', 'page=10001', 'query=' + 'x'.repeat(201), 'view=inbound&job_id=fixture-log-000']) {
+    assert.equal((await adminGet('/v1/admin/email/activity?' + query)).response.status, 400)
+  }
+  for (const view of ['inbound', 'scheduled', 'events', 'flags']) {
+    const result = await adminGet('/v1/admin/email/activity?view=' + view)
+    assert.equal(result.response.status, 200)
+    assert.equal(result.body.view, view)
+    assert.ok(Array.isArray(result.body.items))
+    assert.doesNotMatch(JSON.stringify(result.body), /html_sanitized|text_body|attachments_json|payload_json/)
+  }
+  const eventInsert = db.prepare("INSERT INTO email_events (id, provider_event_id, event_type, email_job_id, payload_json) VALUES (?1, ?1, 'email.sent', ?2, 'fixture-private-event-payload')")
+  await db.batch([eventInsert.bind('fixture-selected-event', 'fixture-log-001'), eventInsert.bind('fixture-unrelated-event', 'fixture-log-002')])
+  const jobDetail = await adminGet('/v1/admin/email/jobs/fixture-log-001')
+  assert.equal(jobDetail.body.job.id, 'fixture-log-001')
+  assert.equal(jobDetail.body.job.retry_allowed, true)
+  assert.deepEqual(jobDetail.body.events.map((event) => event.id), ['fixture-selected-event'])
+  assert.doesNotMatch(JSON.stringify(jobDetail.body), /fixture-private|fixture-unrelated-event/)
+  assert.equal((await adminGet('/v1/admin/email/jobs/fixture-job-not-found')).response.status, 404)
+  const exactEvents = await adminGet('/v1/admin/email/activity?view=events&job_id=fixture-log-001')
+  assert.deepEqual(exactEvents.body.items.map((event) => event.id), ['fixture-selected-event'])
+  const countsBeforeConfig = await db.prepare('SELECT count(*) AS count FROM email_jobs').first()
+  const emailConfig = await adminGet('/v1/admin/email/status?view=configuration')
+  assert.equal(emailConfig.response.status, 200)
+  assert.equal(emailConfig.body.config.outbound_enabled, true)
+  assert.ok(emailConfig.body.catalog.length > 0)
+  assert.equal(emailConfig.body.jobs, undefined)
+  assert.equal(emailConfig.body.inbound, undefined)
+  assert.doesNotMatch(JSON.stringify(emailConfig.body), /local-send-key|local-receive-key|fixture-private/)
+  assert.equal((await db.prepare('SELECT count(*) AS count FROM email_jobs').first()).count, countsBeforeConfig.count)
+  await db.exec('ALTER TABLE email_events RENAME TO email_events_unavailable_fixture')
+  const partialDetail = await adminGet('/v1/admin/email/jobs/fixture-log-001')
+  assert.equal(partialDetail.response.status, 200)
+  assert.equal(partialDetail.body.events_unavailable, true)
+  assert.equal(partialDetail.body.job.id, 'fixture-log-001')
+  assert.equal((await adminGet('/v1/admin/email/activity?view=events')).response.status, 503)
+  await db.exec('ALTER TABLE email_jobs RENAME TO email_jobs_unavailable_fixture')
+  const unavailableActivity = await adminGet(activityPath)
+  assert.equal(unavailableActivity.response.status, 503)
+  assert.deepEqual(unavailableActivity.body, { success: false, error: 'email_activity_unavailable' })
+  assert.equal((await adminGet('/v1/admin/email/jobs/fixture-log-001')).response.status, 503)
+  console.log('PASS Email metadata pagination, literal search, exact-job events, suppression, payload privacy, directed processing, and unavailable-source behavior')
+  await db.exec('ALTER TABLE support_audit_events RENAME TO support_audit_events_unavailable_fixture')
+  assert.equal((await adminGet(history)).response.status, 503)
+  assert.equal((await adminGet(`/v1/admin/support/conversation?thread_id=${ticketId}`)).response.status, 200)
+  const legacyWithoutHistory = await adminGet(`/v1/admin/support/messages?thread_id=${ticketId}`)
+  assert.equal(legacyWithoutHistory.response.status, 200)
+  assert.equal(legacyWithoutHistory.body.audit_unavailable, true)
+  await db.exec('ALTER TABLE support_messages RENAME TO support_messages_unavailable_fixture')
+  const unavailableConversation = await adminGet('/v1/admin/support/messages?thread_id=fixture-inbox-second')
+  assert.equal(unavailableConversation.response.status, 503)
+  assert.equal((await db.prepare("SELECT admin_last_read_at FROM support_threads WHERE id = 'fixture-inbox-second'").first()).admin_last_read_at, null)
+  await db.exec('ALTER TABLE support_threads RENAME TO support_threads_unavailable_fixture')
+  const unavailableInbox = await adminGet(inbox)
+  assert.equal(unavailableInbox.response.status, 503)
+  assert.deepEqual(unavailableInbox.body, { success: false, error: 'support_inbox_unavailable' })
+
+  console.log('Support, inbox pagination and recovery, notification, webhook, idempotency, ownership, rate-limit, and lock checks passed.')
 } finally {
   await mf.dispose()
   await rm(temp, { recursive: true, force: true })

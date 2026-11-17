@@ -36,7 +36,12 @@ function assertNotIncludes(source, token, label) {
 
 const productionAdapters = read('site/src/new-ui/adapters/productionAdapters.ts')
 const productionPages = read('site/src/new-ui/pages/production/ProductionPages.tsx')
-const adminOperations = read('site/src/new-ui/pages/production/AdminOperations.tsx')
+const adminSupport = read('site/src/new-ui/pages/production/AdminSupportWorkspace.tsx')
+const adminRelease = read('site/src/new-ui/pages/production/AdminReleaseWorkspace.tsx')
+const adminGovernance = read('site/src/new-ui/pages/production/AdminGovernanceWorkspace.tsx')
+const globalPolicy = read('site/src/new-ui/pages/production/AdminGlobalPolicy.tsx')
+assertNotIncludes(read('workers/policy/src/index.ts'), 'function adminHtml(', 'retired embedded policy UI')
+assertNotIncludes(read('workers/admin/src/index.js'), 'serveAdminPolicyControlsScript', 'retired injected policy panel')
 const supportApi = read('site/src/api/support.ts')
 const emailVerificationApi = read('site/src/api/emailVerification.ts')
 const featureFlags = read('site/src/new-ui/adapters/productionFeatureFlags.ts')
@@ -77,11 +82,13 @@ assertIncludes(productionPages, 'auth.finalizeEmailRegistration', 'auth signup p
 assertIncludes(productionPages, 'auth.verifyEmailCode', 'auth email verification code UI')
 assertIncludes(productionPages, 'support.createTicket', 'portal support create UI')
 assertIncludes(productionPages, 'support.replyThread', 'portal support reply UI')
-assertIncludes(productionPages, 'admin.sendSupportReply', 'admin support reply UI')
-assertIncludes(productionPages, 'admin.setSupportBlocked', 'admin support block UI')
-assertIncludes(productionPages, 'adapters.admin.uploadRelease', 'admin release upload UI')
-assertIncludes(productionPages, 'adapters.admin.publishRelease', 'admin release publish UI')
-assertIncludes(adminOperations, 'admin.updateGlobalPolicy', 'admin policy update UI')
+assertIncludes(adminSupport, 'admin.sendSupportReply', 'admin support reply UI')
+assertIncludes(adminSupport, 'admin.setSupportBlocked', 'admin support block UI')
+assertIncludes(adminRelease, 'admin.uploadRelease({ file: draft.file', 'admin release upload uses reviewed file')
+assertIncludes(adminRelease, 'admin.publishRelease({ version: draft.version', 'admin release publish uses reviewed version')
+assertIncludes(adminGovernance, '<AdminGlobalPolicy', 'admin policy editor integration')
+assertIncludes(globalPolicy, 'admin.updateGlobalPolicy(review)', 'admin policy update UI')
+assertIncludes(globalPolicy, 'expected_revision: base.revision', 'admin policy reviewed snapshot')
 
 for (const flag of [
   'emailVerification',

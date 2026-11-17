@@ -1,5 +1,6 @@
 import { handleCreatePayment, handleGetPaymentStatus, handleListPlans } from "./routes/payments.js";
-import { resolveSubscriptionTruth } from "../../shared/subscriptions/resolver.js";
+import { resolveSubscriptionTruth, subscriptionLifecycle, subscriptionPlanTerm } from "../../shared/subscriptions/resolver.js";
+import { readBoundedRequestText } from "../../shared/requestBody.js";
 import { handleDownloadCatalog, handleDownloadFile } from "./routes/downloads.js";
 import {
   assertArtifactBinarySignature,
@@ -7,13 +8,18 @@ import {
   mergeWhatsNewReleaseHistory,
   releaseTargetAudienceKey,
 } from "./releaseContract.js";
-import { classifyDiagnostic, isActionableCrash } from "./diagnosticClassification.js";
+import { classifyDiagnostic } from "./diagnosticClassification.js";
+import { supabasePage } from "./services/supabase.js";
+import { deliverAdminAudit, loadLegacyAdminAudit, replayPendingAdminAudit } from "./services/adminAuditDelivery.js";
+import { listAdminUsers } from "./services/adminUserDirectory.js";
+import { commerceConfiguration, getCommerceOrder, listCommerceIntegrity, listCommerceOrders, listCommercePlans } from "./services/adminCommerce.js";
 import {
   adminContext,
   adminRoleAssignmentsState,
   executeAccessRevocation,
   executeAccountLifecycle,
   executeSubscriptionTransition,
+  hasPermission,
   listRecoveryEvidence,
   previewAccessRevocation,
   previewAccountLifecycle,
@@ -216,14 +222,7 @@ export async function enforceCrashIngestRateLimit(request, env, _body) {
 }
 
 export async function readCrashIngestBody(request) {
-  const contentLength = Number(request.headers.get("Content-Length") || 0);
-  if (Number.isFinite(contentLength) && contentLength > MAX_CRASH_INGEST_BYTES) {
-    throw new Error("diagnostic_payload_too_large");
-  }
-  const raw = await request.text();
-  if (new TextEncoder().encode(raw).byteLength > MAX_CRASH_INGEST_BYTES) {
-    throw new Error("diagnostic_payload_too_large");
-  }
+  const raw = await readBoundedRequestText(request, MAX_CRASH_INGEST_BYTES, "diagnostic_payload_too_large");
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -237,8 +236,9 @@ export async function readCrashIngestBody(request) {
 }
 
 export default {
-  async scheduled(_controller, env, context) {
-    context.waitUntil(purgeExpiredDiagnostics(env));
+  async scheduled(controller, env, context) {
+    if (controller.cron === "*/15 * * * *") context.waitUntil(replayPendingAdminAudit(env, supabaseRequest));
+    if (controller.cron === "17 3 * * *") context.waitUntil(purgeExpiredDiagnostics(env));
   },
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -292,8 +292,8 @@ export default {
         return json({ success: true, email: context.email, role: context.role, permissions: context.permissions }, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/state" && request.method === "GET") {
-        await requireAdmin(request, env);
-        return json(await loadDashboardState(env), 200, corsHeaders(request, env));
+        await requireAdminContext(request, env, "*");
+        return json(await loadDashboardState(env), 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
       }
       if (url.pathname === "/api/admin/upload" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "releases:write");
@@ -303,37 +303,54 @@ export default {
         const context = await requireAdminContext(request, env, "releases:write");
         return json(await publishRelease(request, env, context.email), 200, corsHeaders(request, env));
       }
+      if (url.pathname === "/api/admin/releases/publish-reviewed" && request.method === "POST") {
+        const context = await requireAdminContext(request, env, "releases:write");
+        return json(await publishRelease(request, env, context.email, { requireReview: true }), 200, corsHeaders(request, env));
+      }
       if (url.pathname === "/api/admin/reset-baseline" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "releases:write");
         return json(await resetOtaBaseline(request, env, context.email), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/history" && request.method === "GET") {
-        await requireAdmin(request, env);
+        const context = await requireAdminContext(request, env, "releases:read");
+        requirePermission(context, "audit:read");
         const channel = normalizeChannel(url.searchParams.get("channel"));
-        return json(await getReleaseHistory(env, channel), 200, corsHeaders(request, env));
+        return json(await getReleaseHistory(env, channel), 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
       }
       if (url.pathname === "/api/admin/remote-config" && request.method === "GET") {
-        await requireAdmin(request, env);
+        await requireAdminContext(request, env, "policies:read");
         return json(await getRemoteControls(url, env), 200, corsHeaders(request, env));
+      }
+      if (url.pathname === "/api/admin/releases/current" && request.method === "GET") {
+        await requireAdminContext(request, env, "releases:read");
+        return json(await getCurrentAdminRelease(url, env), 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
+      }
+      if (url.pathname === "/api/admin/releases/staged" && request.method === "GET") {
+        await requireAdminContext(request, env, "releases:write");
+        return json(await getStagedAdminRelease(url, env), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/remote-config" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "policies:write");
         return json(await updateRemoteControls(request, env, context.email), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/state" && request.method === "GET") {
-        await requireAdminContext(request, env, "policies:read");
+        await requireAdminContext(request, env, "*");
         return json(await proxyPolicyAdmin(request, env, "/v1/admin/state"), 200, corsHeaders(request, env));
+      }
+      if (url.pathname === "/api/admin/policy/global-policy" && request.method === "GET") {
+        const context = await requireAdminContext(request, env, "policies:read");
+        return json(await proxyPolicyAdmin(request, env, "/v1/admin/global-policy", context), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/global-policy" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "policies:write");
         const payload = await proxyPolicyAdmin(request, env, "/v1/admin/global-policy", context);
-        await appendAudit(env, { type: "policy_global_update", actor: context.email, at: new Date().toISOString() });
+        if (!payload.replay) await appendAudit(env, { type: "policy_global_update", actor: context.email, payload: { request_id: payload.request_id }, at: new Date().toISOString() });
         return json(payload, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/disabled-versions" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "policies:write");
         const payload = await proxyPolicyAdmin(request, env, "/v1/admin/disabled-versions", context);
-        await appendAudit(env, { type: "policy_disabled_version_update", actor: context.email, at: new Date().toISOString() });
+        if (!payload.replay) await appendAudit(env, { type: "policy_disabled_version_update", actor: context.email, payload: { version: payload.version, disabled: payload.disabled, request_id: payload.request_id }, at: new Date().toISOString() });
         return json(payload, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/users" && request.method === "POST") {
@@ -347,6 +364,11 @@ export default {
         const payload = await proxyPolicyAdmin(request, env, "/v1/admin/plan-features", context);
         await appendAudit(env, { type: "policy_plan_features_update", actor: context.email, at: new Date().toISOString() });
         return json(payload, 200, corsHeaders(request, env));
+      }
+      if (["/api/admin/policy/disabled-versions", "/api/admin/policy/plan-features"].includes(url.pathname) && request.method === "GET") {
+        const context = await requireAdminContext(request, env, "policies:read");
+        const path = url.pathname.endsWith("disabled-versions") ? "/v1/admin/disabled-versions" : "/v1/admin/plan-features";
+        return json(await proxyPolicyAdmin(request, env, path + url.search, context), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/releases" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "releases:write");
@@ -372,7 +394,19 @@ export default {
       }
       if (url.pathname === "/api/admin/policy/support" && request.method === "GET") {
         await requireAdmin(request, env);
-        return json(await proxyPolicyAdmin(request, env, "/v1/admin/support"), 200, corsHeaders(request, env));
+        const inbox = url.searchParams.get("view") === "inbox";
+        let payload;
+        try {
+          payload = await proxyPolicyAdmin(request, env, `/v1/admin/support${url.search}`);
+        } catch (error) {
+          if (!inbox || error?.message === "thread_not_found" || error?.message === "invalid_support_inbox_query") throw error;
+          throw new Error("support_inbox_unavailable");
+        }
+        if (inbox && (payload.success !== true || !Array.isArray(payload.threads) ||
+            !Number.isSafeInteger(payload.page) || !Number.isSafeInteger(payload.limit) || typeof payload.has_more !== "boolean")) {
+          throw new Error("support_inbox_unavailable");
+        }
+        return json(payload, 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
       }
       if (url.pathname === "/api/admin/policy/support/messages" && request.method === "GET") {
         await requireAdmin(request, env);
@@ -383,6 +417,28 @@ export default {
           corsHeaders(request, env),
         );
       }
+      if (["/api/admin/policy/support/conversation", "/api/admin/policy/support/history"].includes(url.pathname) && request.method === "GET") {
+        await requireAdmin(request, env);
+        const target = url.pathname.replace("/api/admin/policy/", "/v1/admin/") + url.search;
+        const history = url.pathname.endsWith("/history");
+        const payload = await proxyPolicyAdmin(request, env, target).catch((error) => {
+          if (["thread_not_found", "thread_id_required", "invalid_support_history_query", "invalid_support_history_cursor"].includes(error?.message)) throw error;
+          throw new Error(history ? "support_history_unavailable" : "support_inbox_unavailable");
+        });
+        if (payload.success !== true || (history ? !Array.isArray(payload.events) : !Array.isArray(payload.unread_message_ids))) {
+          throw new Error(history ? "support_history_unavailable" : "support_inbox_unavailable");
+        }
+        return json(payload, 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
+      }
+      if (url.pathname === "/api/admin/policy/support/read" && request.method === "POST") {
+        await requireAdmin(request, env);
+        const payload = await proxyPolicyAdmin(request, env, "/v1/admin/support/read").catch((error) => {
+          if (["thread_not_found", "invalid_support_read"].includes(error?.message)) throw error;
+          throw new Error("support_read_unavailable");
+        });
+        if (payload.success !== true) throw new Error("support_read_unavailable");
+        return json(payload, 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
+      }
       const supportAttachmentMatch = url.pathname.match(/^\/api\/admin\/policy\/support\/attachments\/([^/]+)$/);
       if (supportAttachmentMatch && request.method === "GET") {
         const context = await requireAdminContext(request, env, "support:write");
@@ -391,13 +447,13 @@ export default {
       if (url.pathname === "/api/admin/policy/support/reply" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "support:write");
         const payload = await proxyPolicyAdmin(request, env, "/v1/admin/support/reply", context);
-        await appendAudit(env, { type: "support_reply", actor: context.email, at: new Date().toISOString() });
+        if (payload.success === true && payload.duplicate !== true) await appendAudit(env, { type: "support_reply", actor: context.email, actor_role: context.role });
         return json(payload, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/support/status" && request.method === "POST") {
         const context = await requireAdminContext(request, env, "support:write");
         const payload = await proxyPolicyAdmin(request, env, "/v1/admin/support/status", context);
-        await appendAudit(env, { type: "support_status_update", actor: context.email, at: new Date().toISOString() });
+        if (payload.success === true && payload.duplicate !== true) await appendAudit(env, { type: "support_status_update", actor: context.email, actor_role: context.role });
         return json(payload, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/support/priority" && request.method === "POST") {
@@ -414,7 +470,12 @@ export default {
       }
       if (url.pathname === "/api/admin/policy/email/status" && request.method === "GET") {
         await requireAdmin(request, env);
-        return json(await proxyPolicyAdmin(request, env, "/v1/admin/email/status"), 200, corsHeaders(request, env));
+        return json(await proxyPolicyAdmin(request, env, `/v1/admin/email/status${url.search || ""}`), 200, corsHeaders(request, env));
+      }
+      if ((url.pathname === "/api/admin/policy/email/activity" || /^\/api\/admin\/policy\/email\/jobs\/[^/]+$/.test(url.pathname)) && request.method === "GET") {
+        await requireAdmin(request, env);
+        const target = url.pathname.replace("/api/admin/policy/", "/v1/admin/") + (url.search || "");
+        return json(await proxyPolicyAdmin(request, env, target), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/policy/email/preview" && (request.method === "GET" || request.method === "POST")) {
         await requireAdmin(request, env);
@@ -446,8 +507,8 @@ export default {
         return json(await disableRelease(request, env, context.email), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/dashboard" && request.method === "GET") {
-        await requireAdmin(request, env);
-        return json(await getAdminDashboard(env), 200, corsHeaders(request, env));
+        const context = await requireAdminContext(request, env);
+        return json(await getAdminDashboard(env, context), 200, corsHeaders(request, env));
       }
       if ((url.pathname === "/api/admin/subscriptions" || url.pathname === "/api/admin/licenses") && request.method === "GET") {
         await requireAdminContext(request, env, "subscriptions:read");
@@ -472,6 +533,11 @@ export default {
       if (url.pathname === "/api/admin/device-change-requests" && request.method === "GET") {
         await requireAdminContext(request, env, "users:read");
         return json(await listAccountDeviceChangeRequests(url, env), 200, corsHeaders(request, env));
+      }
+      const deviceChangeRecord = url.pathname.match(/^\/api\/admin\/device-change-requests\/([^/]+)$/);
+      if (deviceChangeRecord && request.method === "GET") {
+        await requireAdminContext(request, env, "users:read");
+        return json({ success: true, item: await getAccountDeviceChangeRequest(deviceChangeRecord[1], env) }, 200, corsHeaders(request, env));
       }
       const deviceChangeMatch = url.pathname.match(/^\/api\/admin\/device-change-requests\/([^/]+)\/(preview|execute)$/);
       if (deviceChangeMatch && request.method === "POST") {
@@ -540,14 +606,8 @@ export default {
         url.pathname.endsWith("/reset-hwid") &&
         request.method === "POST"
       ) {
-        const context = await requireAdminContext(request, env, "sessions:revoke");
-        const subscriptionId = decodeURIComponent(
-          url.pathname
-            .replace("/api/admin/subscriptions/", "")
-            .replace("/api/admin/licenses/", "")
-            .replace("/reset-hwid", ""),
-        ).trim();
-        return json(await resetSubscriptionHwid(subscriptionId, request, env, context.email), 200, corsHeaders(request, env));
+        await requireAdminContext(request, env, "sessions:revoke");
+        return json({ success: false, error: "account_device_workflow_required" }, 410, corsHeaders(request, env));
       }
       if ((url.pathname.startsWith("/api/admin/subscriptions/") || url.pathname.startsWith("/api/admin/licenses/")) && request.method === "PATCH") {
         await requireAdminContext(request, env, "subscriptions:write");
@@ -555,12 +615,12 @@ export default {
       }
       if (url.pathname === "/api/admin/users" && request.method === "GET") {
         await requireAdminContext(request, env, "users:read");
-        return json(await listAdminUsers(url, env), 200, corsHeaders(request, env));
+        return json(await listAdminUsers(url.searchParams, env, request.signal), 200, corsHeaders(request, env));
       }
       if (url.pathname.startsWith("/api/admin/users/") && request.method === "GET") {
-        await requireAdminContext(request, env, "users:read");
+        const context = await requireAdminContext(request, env, "users:read");
         const userKey = decodeURIComponent(url.pathname.replace("/api/admin/users/", "")).trim();
-        return json(await getUserDetail(userKey, env), 200, corsHeaders(request, env));
+        return json(await getUserDetail(userKey, env, context, url.searchParams.get("view") === "account"), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/promo-codes" && request.method === "GET") {
         await requireAdminContext(request, env, "admin:read");
@@ -576,11 +636,22 @@ export default {
         return json(await updatePromoCodeState(decodeURIComponent(promoStateMatch[1]).trim(), request, env, context.email), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/commerce/overview" && request.method === "GET") {
-        await requireAdmin(request, env);
-        return json(await getAdminCommerceOverview(env), 200, corsHeaders(request, env));
+        const context = await requireAdminContext(request, env, "commerce:read");
+        return json(await getAdminCommerceOverview(env, context), 200, corsHeaders(request, env));
+      }
+      if (url.pathname.startsWith("/api/admin/commerce/") && request.method === "GET") {
+        await requireAdminContext(request, env, "commerce:read");
+        const detail = url.pathname.match(/^\/api\/admin\/commerce\/orders\/([^/]+)$/);
+        const result = url.pathname === "/api/admin/commerce/configuration" ? commerceConfiguration(env)
+          : url.pathname === "/api/admin/commerce/orders" ? await listCommerceOrders(env, url.searchParams)
+          : url.pathname === "/api/admin/commerce/plans" ? await listCommercePlans(env, url.searchParams)
+          : url.pathname === "/api/admin/commerce/integrity" ? await listCommerceIntegrity(env, url.searchParams)
+          : detail ? await getCommerceOrder(env, detail[1], url.searchParams) : null;
+        if (!result) return json({ success: false, error: "not_found" }, 404, corsHeaders(request, env));
+        return json(result, 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/ota-updates" && request.method === "GET") {
-        await requireAdmin(request, env);
+        await requireAdminContext(request, env, "releases:read");
         return json(await listOtaUpdates(url, env), 200, corsHeaders(request, env));
       }
       if (url.pathname === "/api/admin/ota-updates" && request.method === "POST") {
@@ -600,6 +671,14 @@ export default {
         await requireAdminContext(request, env, "diagnostics:read");
         return json(await listCrashGroups(url, env), 200, corsHeaders(request, env));
       }
+      if (url.pathname === "/api/admin/diagnostic-triage" && request.method === "GET") {
+        await requireAdminContext(request, env, "diagnostics:read");
+        return json(await readDiagnosticTriage(url, env), 200, corsHeaders(request, env));
+      }
+      if (url.pathname === "/api/admin/diagnostic-coverage" && request.method === "GET") {
+        await requireAdminContext(request, env, "diagnostics:read");
+        return json(await readDiagnosticCoverage(url, env), 200, corsHeaders(request, env));
+      }
       const crashGroupStateMatch = url.pathname.match(/^\/api\/admin\/crash-groups\/([^/]+)\/state$/);
       if (crashGroupStateMatch && request.method === "POST") {
         const context = await requireAdminContext(request, env, "diagnostics:write");
@@ -617,7 +696,7 @@ export default {
       }
       if (url.pathname === "/api/admin/audit-log" && request.method === "GET") {
         await requireAdminContext(request, env, "audit:read");
-        return json(await listAuditLog(url, env), 200, corsHeaders(request, env));
+        return json(await listAuditLog(url, env), 200, { ...corsHeaders(request, env), "Cache-Control": "private, no-store" });
       }
       if (url.pathname === "/api/admin/readiness" && request.method === "GET") {
         await requireAdminContext(request, env, "admin:read");
@@ -662,19 +741,16 @@ export default {
       const authErrors = new Set([
         "unauthorized",
         "preauth_required",
-        "admin_allowlist_empty",
-        "firebase_not_configured",
         "firebase_token_invalid",
-        "firebase_email_not_verified",
         "firebase_token_missing",
         "firebase_user_not_verified",
         "session_expired",
         "session_revoked",
       ]);
-      const forbiddenErrors = new Set(["download_not_entitled", "forbidden_origin", "origin_not_allowed", "admin_permission_denied"]);
-      const notFoundErrors = new Set(["release_not_found", "release_artifact_missing", "order_not_found", "account_not_found", "subscription_not_found", "session_not_found", "device_not_found", "pending_grant_not_found", "device_change_request_not_found", "diagnostic_not_found"]);
-      const conflictErrors = new Set(["pending_grant_already_exists", "pending_grant_not_pending", "device_change_request_not_pending", "device_change_request_changed", "preview_changed", "same_version_already_active", "release_version_not_newer", "subscription_integrity_conflict", "historical_subscription_cannot_be_reactivated", "stale_subscription_state", "operation_previously_failed"]);
-      const status = authErrors.has(message) || message.startsWith("admin_email_not_allowed")
+      const forbiddenErrors = new Set(["firebase_email_not_verified", "admin_email_not_allowed", "download_not_entitled", "forbidden_origin", "origin_not_allowed", "admin_permission_denied"]);
+      const notFoundErrors = new Set(["policy_plan_not_found", "invite_not_found", "release_not_found", "release_artifact_missing", "order_not_found", "account_not_found", "subscription_not_found", "session_not_found", "device_not_found", "pending_grant_not_found", "device_change_request_not_found", "diagnostic_not_found", "thread_not_found"]);
+      const conflictErrors = new Set(["policy_state_changed", "policy_request_conflict", "invite_request_conflict", "invite_not_active", "promo_code_exists", "promo_code_changed", "pending_grant_already_exists", "pending_grant_not_pending", "device_change_request_not_pending", "device_change_request_changed", "device_reset_request_conflict", "preview_changed", "manual_grant_target_changed", "same_version_already_active", "release_version_not_newer", "reviewed_release_artifacts_changed", "subscription_integrity_conflict", "historical_subscription_cannot_be_reactivated", "stale_subscription_state", "operation_previously_failed"]);
+      const status = authErrors.has(message)
         ? 401
         : forbiddenErrors.has(message)
           ? 403
@@ -684,8 +760,10 @@ export default {
               ? 409
             : message === "rate_limited"
               ? 429
-              : message === "rate_limit_unavailable"
+              : message === "policy_records_unavailable" || message === "policy_state_unavailable" || message === "policy_write_unconfirmed" || message === "commerce_unavailable" || message === "invite_read_unavailable" || message === "invite_write_unconfirmed" || message === "promo_codes_unavailable" || message === "promo_save_unconfirmed" || message === "rate_limit_unavailable" || message === "support_inbox_unavailable" || message === "device_change_requests_unavailable" || message === "device_reset_unavailable" || message === "diagnostics_unavailable" || message === "audit_unavailable"
                 ? 503
+                : ["admin_identity_unavailable", "admin_allowlist_empty", "firebase_not_configured", "admin_users_unavailable", "manual_grant_subscription_history_unavailable", "support_history_unavailable", "support_read_unavailable", "subscriptions_unavailable", "pending_grants_unavailable", "release_channel_unavailable"].includes(message)
+                  ? 503
                 : message === "diagnostic_payload_too_large"
                   ? 413
               : 400;
@@ -734,110 +812,6 @@ async function proxyAdminFrontend(url) {
   });
 }
 
-function serveAdminPolicyControlsScript() {
-  const source = String.raw`
-(function () {
-  if (window.__saturnPolicyControlsLoaded) return;
-  window.__saturnPolicyControlsLoaded = true;
-
-  const styles = document.createElement("style");
-  styles.textContent = [
-    "#saturn-policy-admin{position:fixed;left:18px;bottom:18px;z-index:2147483000;font-family:Inter,Arial,sans-serif;color:#e5edf8;direction:ltr}",
-    "#saturn-policy-admin *{box-sizing:border-box}",
-    "#saturn-policy-toggle{border:1px solid rgba(96,165,250,.35);background:linear-gradient(135deg,#1d4ed8,#0f172a);color:white;border-radius:999px;padding:10px 14px;font-weight:800;font-size:12px;box-shadow:0 16px 42px rgba(0,0,0,.35);cursor:pointer}",
-    "#saturn-policy-panel{display:none;width:min(760px,calc(100vw - 36px));max-height:min(760px,calc(100vh - 96px));overflow:auto;margin-bottom:12px;border:1px solid rgba(148,163,184,.22);background:#0f141c;border-radius:22px;box-shadow:0 22px 70px rgba(0,0,0,.55)}",
-    "#saturn-policy-admin.open #saturn-policy-panel{display:block}",
-    ".sp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px 18px;border-bottom:1px solid rgba(148,163,184,.18);background:#151b25}",
-    ".sp-title{font-weight:900;font-size:15px;color:#f8fafc}.sp-sub{margin-top:4px;font-size:12px;color:#94a3b8}",
-    ".sp-body{display:grid;gap:12px;padding:16px}.sp-card{border:1px solid rgba(148,163,184,.16);background:#121821;border-radius:16px;padding:14px}",
-    ".sp-card h3{margin:0 0 10px;font-size:13px;color:#e2e8f0}.sp-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}",
-    ".sp-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.sp-field{display:grid;gap:5px;font-size:11px;color:#94a3b8}.sp-field input,.sp-field select,.sp-field textarea{min-height:36px;border:1px solid rgba(148,163,184,.2);background:#0b1118;color:#e5edf8;border-radius:10px;padding:8px 10px;outline:none}.sp-field textarea{min-height:70px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}.sp-field input[type=checkbox]{min-height:auto;width:18px;height:18px}",
-    ".sp-btn{border:1px solid rgba(148,163,184,.22);background:#1b2430;color:#e5edf8;border-radius:10px;padding:9px 12px;font-size:12px;font-weight:800;cursor:pointer}.sp-btn.primary{border-color:rgba(59,130,246,.45);background:#2563eb;color:white}.sp-btn:disabled{opacity:.55;cursor:not-allowed}",
-    ".sp-status{white-space:pre-wrap;border:1px solid rgba(148,163,184,.16);background:#0b1118;border-radius:12px;padding:10px;font-size:11px;color:#a7b4c7;max-height:180px;overflow:auto}",
-    ".sp-list{display:grid;gap:6px;max-height:160px;overflow:auto}.sp-pill{display:flex;justify-content:space-between;gap:10px;border:1px solid rgba(148,163,184,.13);background:#0b1118;border-radius:10px;padding:8px 10px;font-size:11px;color:#cbd5e1}",
-    "@media(max-width:760px){.sp-grid{grid-template-columns:1fr}}"
-  ].join("");
-  document.head.appendChild(styles);
-
-  const root = document.createElement("div");
-  root.id = "saturn-policy-admin";
-  root.innerHTML = '<div id="saturn-policy-panel"><div class="sp-head"><div><div class="sp-title">Policy Controls</div><div class="sp-sub">Live controls backed by api.saturnws.com policy API. Secrets stay server-side.</div></div><button class="sp-btn" data-close>Close</button></div><div class="sp-body"><div class="sp-card"><h3>Global policy</h3><div class="sp-grid"><label class="sp-field">Update mode<select data-global-update-mode><option value="optional">optional</option><option value="mandatory">mandatory</option></select></label><label class="sp-field">Minimum supported version<input data-global-min-version placeholder="1.0.0"></label><label class="sp-field">Kill switch<input data-global-kill type="checkbox"></label><label class="sp-field">Mandatory update<input data-global-mandatory type="checkbox"></label><label class="sp-field">Blocked actions<textarea data-global-blocked placeholder="one action per line"></textarea></label><label class="sp-field">Features JSON<textarea data-global-features>{}</textarea></label></div><div class="sp-row" style="margin-top:10px"><button class="sp-btn primary" data-save-global>Save global policy</button></div></div><div class="sp-card"><h3>Disabled versions</h3><div class="sp-grid"><label class="sp-field">Version<input data-disabled-version placeholder="1.0.0"></label><label class="sp-field">Reason<input data-disabled-reason placeholder="reason"></label></div><div class="sp-row" style="margin-top:10px"><button class="sp-btn" data-disable-version>Disable version</button><button class="sp-btn" data-enable-version>Remove disabled version</button></div></div><div class="sp-card"><h3>User policy override</h3><div class="sp-grid"><label class="sp-field">Email<input data-user-email placeholder="user@example.com"></label><label class="sp-field">Status<select data-user-status><option value="active">active</option><option value="disabled">disabled</option><option value="banned">banned</option><option value="blocked">blocked</option></select></label><label class="sp-field">Plan<input data-user-plan value="default"></label><label class="sp-field">Subscription status<select data-sub-status><option value="">no change</option><option value="active">active</option><option value="expired">expired</option><option value="inactive">inactive</option><option value="canceled">canceled</option></select></label></div><div class="sp-row" style="margin-top:10px"><button class="sp-btn primary" data-save-user>Save user policy</button></div></div><div class="sp-card"><h3>Plan features / blocked actions</h3><div class="sp-grid"><label class="sp-field">Plan ID<input data-plan-id value="default"></label><label class="sp-field">Blocked actions<textarea data-plan-blocked placeholder="one action per line"></textarea></label><label class="sp-field">Features JSON<textarea data-plan-features>{}</textarea></label><label class="sp-field">Limits JSON<textarea data-plan-limits>{}</textarea></label></div><div class="sp-row" style="margin-top:10px"><button class="sp-btn primary" data-save-plan>Save plan</button></div></div><div class="sp-card"><h3>Release catalog visibility</h3><div class="sp-grid"><label class="sp-field">Version<input data-release-version value="1.0.0"></label><label class="sp-field">Visibility<select data-release-visibility><option value="public">public</option><option value="internal">internal</option><option value="archived">archived</option><option value="hidden">hidden</option></select></label><label class="sp-field">Release type<input data-release-type value="public_release"></label><label class="sp-field">Artifact kind<input data-release-kind value="full_setup"></label></div><div class="sp-row" style="margin-top:10px"><button class="sp-btn primary" data-save-release>Save release catalog</button></div></div><div class="sp-card"><h3>Current policy state</h3><div class="sp-status" data-policy-log>Not loaded yet.</div><div class="sp-list" data-release-list></div></div></div></div><button id="saturn-policy-toggle">Policy Controls</button>';
-  document.body.appendChild(root);
-
-  const $ = (sel) => root.querySelector(sel);
-  const log = (message) => { $("[data-policy-log]").textContent = typeof message === "string" ? message : JSON.stringify(message, null, 2); };
-  const token = () => window.sessionStorage.getItem("st_admin_firebase_token") || "";
-  const api = async (path, options) => {
-    const headers = new Headers((options && options.headers) || {});
-    if (!headers.has("Content-Type") && options && options.body) headers.set("Content-Type", "application/json");
-    const bearer = token();
-    if (bearer) headers.set("Authorization", "Bearer " + bearer);
-    const res = await fetch(path, { ...(options || {}), headers, credentials: "same-origin" });
-    const payload = await res.json().catch(() => null);
-    if (!res.ok) throw new Error((payload && payload.error) || ("request_failed_" + res.status));
-    return payload;
-  };
-  const listFromText = (value) => String(value || "").split(/\r?\n|,/).map((x) => x.trim()).filter(Boolean);
-  const parseJson = (value, fallback) => {
-    try { return JSON.parse(value || JSON.stringify(fallback)); } catch { return fallback; }
-  };
-  const render = (state) => {
-    const global = state.global_policy || {};
-    $("[data-global-update-mode]").value = global.update_mode || "optional";
-    $("[data-global-min-version]").value = global.minimum_supported_version || "";
-    $("[data-global-kill]").checked = Boolean(global.kill_switch_enabled);
-    $("[data-global-mandatory]").checked = Boolean(global.mandatory_update_enabled);
-    $("[data-global-blocked]").value = JSON.parse(global.blocked_actions_json || "[]").join("\n");
-    $("[data-global-features]").value = JSON.stringify(JSON.parse(global.features_json || "{}"), null, 2);
-    const releases = Array.isArray(state.releases) ? state.releases : [];
-    $("[data-release-list]").innerHTML = releases.slice(0, 10).map((r) => '<div class="sp-pill"><span>' + r.version + '</span><span>' + r.visibility + ' / ' + r.release_type + '</span></div>').join("");
-    log(state);
-  };
-  const load = async () => {
-    try { render(await api("/api/admin/policy/state")); } catch (err) { log("Policy state failed: " + (err && err.message ? err.message : err)); }
-  };
-
-  $("#saturn-policy-toggle").addEventListener("click", () => { root.classList.toggle("open"); if (root.classList.contains("open")) void load(); });
-  $("[data-close]").addEventListener("click", () => root.classList.remove("open"));
-  $("[data-save-global]").addEventListener("click", async () => {
-    try {
-      log(await api("/api/admin/policy/global-policy", { method: "POST", body: JSON.stringify({
-        update_mode: $("[data-global-update-mode]").value,
-        minimum_supported_version: $("[data-global-min-version]").value,
-        kill_switch_enabled: $("[data-global-kill]").checked,
-        mandatory_update_enabled: $("[data-global-mandatory]").checked,
-        blocked_actions: listFromText($("[data-global-blocked]").value),
-        features: parseJson($("[data-global-features]").value, {}),
-        limits: {}
-      }) }));
-      await load();
-    } catch (err) { log("Save failed: " + (err && err.message ? err.message : err)); }
-  });
-  $("[data-disable-version]").addEventListener("click", async () => {
-    try { log(await api("/api/admin/policy/disabled-versions", { method: "POST", body: JSON.stringify({ version: $("[data-disabled-version]").value, reason: $("[data-disabled-reason]").value }) })); await load(); } catch (err) { log("Disable failed: " + (err && err.message ? err.message : err)); }
-  });
-  $("[data-enable-version]").addEventListener("click", async () => {
-    try { log(await api("/api/admin/policy/disabled-versions", { method: "POST", body: JSON.stringify({ version: $("[data-disabled-version]").value, disabled: false }) })); await load(); } catch (err) { log("Enable failed: " + (err && err.message ? err.message : err)); }
-  });
-  $("[data-save-user]").addEventListener("click", async () => {
-    try { log(await api("/api/admin/policy/users", { method: "POST", body: JSON.stringify({ email: $("[data-user-email]").value, status: $("[data-user-status]").value, plan_id: $("[data-user-plan]").value, subscription_status: $("[data-sub-status]").value }) })); await load(); } catch (err) { log("User save failed: " + (err && err.message ? err.message : err)); }
-  });
-  $("[data-save-plan]").addEventListener("click", async () => {
-    try { log(await api("/api/admin/policy/plan-features", { method: "POST", body: JSON.stringify({ plan_id: $("[data-plan-id]").value, blocked_actions: listFromText($("[data-plan-blocked]").value), features: parseJson($("[data-plan-features]").value, {}), limits: parseJson($("[data-plan-limits]").value, {}) }) })); await load(); } catch (err) { log("Plan save failed: " + (err && err.message ? err.message : err)); }
-  });
-  $("[data-save-release]").addEventListener("click", async () => {
-    try { log(await api("/api/admin/policy/releases", { method: "POST", body: JSON.stringify({ version: $("[data-release-version]").value, channel: "beta", visibility: $("[data-release-visibility]").value, release_type: $("[data-release-type]").value, artifact_kind: $("[data-release-kind]").value }) })); await load(); } catch (err) { log("Release save failed: " + (err && err.message ? err.message : err)); }
-  });
-})();
-`;
-  return new Response(source, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/javascript; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
-}
 
 function normalizeOrigin(value) {
   const raw = String(value || "").trim();
@@ -1093,22 +1067,32 @@ async function verifyFirebaseAdminIdentity(idToken, env) {
   const webApiKey = String(env.FIREBASE_WEB_API_KEY || "").trim();
   if (!webApiKey) throw new Error("firebase_not_configured");
 
-  const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(webApiKey)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ idToken }),
-  });
-  if (!response.ok) throw new Error("firebase_token_invalid");
-
-  const payload = await response.json().catch(() => null);
-  const user = payload?.users?.[0];
-  const uid = String(user?.localId || "").trim();
-  const email = String(user?.email || "").trim().toLowerCase();
-  const emailVerified = Boolean(user?.emailVerified);
-
-  if (!email || !uid) throw new Error("firebase_token_invalid");
-  if (!emailVerified) throw new Error("firebase_email_not_verified");
-  if (!allowlist.includes(email)) throw new Error(`admin_email_not_allowed:${email}`);
+  let response, payload;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(webApiKey)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ idToken }),
+      signal: controller.signal,
+    });
+    payload = JSON.parse(await readBoundedRequestText(response, 65536, "admin_identity_unavailable", true));
+  } catch {
+    throw new Error("admin_identity_unavailable");
+  } finally { clearTimeout(timeout); }
+  if (!response.ok) {
+    const code = payload?.error?.message;
+    if ([400, 401].includes(response.status) && ["INVALID_ID_TOKEN", "TOKEN_EXPIRED", "USER_NOT_FOUND", "USER_DISABLED"].includes(code)) throw new Error("firebase_token_invalid");
+    throw new Error("admin_identity_unavailable");
+  }
+  const user = Array.isArray(payload?.users) && payload.users.length === 1 ? payload.users[0] : null;
+  if (typeof user?.localId !== "string" || !user.localId.trim() || typeof user.email !== "string" || !user.email.trim() || typeof user.emailVerified !== "boolean") throw new Error("admin_identity_unavailable");
+  const uid = user.localId.trim();
+  const email = user.email.trim().toLowerCase();
+  if (user.disabled === true) throw new Error("firebase_token_invalid");
+  if (!user.emailVerified) throw new Error("firebase_email_not_verified");
+  if (!allowlist.includes(email)) throw new Error("admin_email_not_allowed");
   return { email, uid };
 }
 
@@ -1348,7 +1332,7 @@ function artifactContentType(artifactType) {
 
 function releaseObjectKeyForArtifact(channel, version, artifactType, filename) {
   const now = new Date().toISOString().replace(/[:.]/g, "-");
-  return `releases/${channel}/${version}/${artifactType}/${now}_${sanitizeFilename(filename)}`;
+  return `releases/${channel}/${version}/${artifactType}/${now}_${crypto.randomUUID()}_${sanitizeFilename(filename)}`;
 }
 
 function normalizeReleaseMeta(channel, version, payload) {
@@ -1438,6 +1422,43 @@ function uploadedReleaseArtifacts(release) {
   return { portable, installed, primary: portable || installed };
 }
 
+async function describeStagedReleaseArtifact(record) {
+  if (!record) return null;
+  return {
+    filename: record.filename,
+    size_bytes: record.size,
+    revision: await sha256Hex(stableStringify([record.key, record.filename, record.size, record.sha256, record.package_type])),
+  };
+}
+
+async function stagedReleaseDescriptors({ portable, installed }) {
+  const [portableDescriptor, installedDescriptor] = await Promise.all([
+    describeStagedReleaseArtifact(portable), describeStagedReleaseArtifact(installed),
+  ]);
+  return { portable: portableDescriptor, installed: installedDescriptor };
+}
+
+async function getStagedAdminRelease(url, env) {
+  if (!hasOtaBucket(env)) throw new Error("r2_not_enabled");
+  const rawChannel = url.searchParams.get("channel");
+  if (!CHANNELS.includes(rawChannel)) throw new Error("invalid_release_channel");
+  const channel = rawChannel;
+  const version = normalizeVersion(url.searchParams.get("version"));
+  const object = await env.OTA_BUCKET.get(`meta/${channel}/${version}.json`);
+  const release = normalizeReleaseMeta(channel, version, object ? await object.json() : null);
+  return { success: true, channel, version, artifacts: await stagedReleaseDescriptors(uploadedReleaseArtifacts(release)) };
+}
+
+function validateReviewedReleaseArtifacts(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).length !== ARTIFACT_TYPES.length ||
+      ARTIFACT_TYPES.some((kind) => !Object.hasOwn(value, kind) ||
+        (value[kind] !== null && (typeof value[kind] !== "string" || !/^[a-f0-9]{64}$/.test(value[kind]))))) {
+    throw new Error("invalid_reviewed_release_artifacts");
+  }
+  return value;
+}
+
 function artifactDownloadUrl(record, downloadUrlBase) {
   const key = String(record?.key || "").trim();
   return key ? `${downloadUrlBase}/file/${encodeURIComponent(key)}` : "";
@@ -1521,12 +1542,15 @@ async function uploadReleaseBinary(request, env, adminEmail) {
     actor: adminEmail,
     at: new Date().toISOString(),
   });
-  return { success: true, release: releaseRecord, artifact_type: artifactType, meta: mergedMeta };
+  return { success: true, release: releaseRecord, artifact_type: artifactType, meta: mergedMeta,
+    staged_artifact: await describeStagedReleaseArtifact(releaseRecord) };
 }
 
-async function publishRelease(request, env, adminEmail) {
+async function publishRelease(request, env, adminEmail, { requireReview = false } = {}) {
   if (!hasOtaBucket(env)) throw new Error("r2_not_enabled");
   const body = await request.json();
+  const reviewed = requireReview ? validateReviewedReleaseArtifacts(body?.reviewed_artifacts) : null;
+  if (requireReview && !CHANNELS.includes(body?.channel)) throw new Error("invalid_release_channel");
   const channel = normalizeChannel(body?.channel);
   const version = normalizeVersion(body?.version);
   const updateMode = normalizeUpdateMode(body?.update_mode);
@@ -1540,10 +1564,16 @@ async function publishRelease(request, env, adminEmail) {
 
   const metaKey = `meta/${channel}/${version}.json`;
   const metaObj = await env.OTA_BUCKET.get(metaKey);
-  if (!metaObj) throw new Error("release_not_uploaded");
-  const release = normalizeReleaseMeta(channel, version, await metaObj.json());
+  if (!metaObj && !reviewed) throw new Error("release_not_uploaded");
+  const release = normalizeReleaseMeta(channel, version, metaObj ? await metaObj.json() : null);
   const downloadUrlBase = String(env.PUBLIC_UPDATES_BASE_URL || "https://saturnws.com/updates").replace(/\/+$/, "");
   const { portable: portableRelease, installed: installedRelease, primary: primaryRelease } = uploadedReleaseArtifacts(release);
+  if (reviewed) {
+    const staged = await stagedReleaseDescriptors({ portable: portableRelease, installed: installedRelease });
+    if (ARTIFACT_TYPES.some((kind) => reviewed[kind] !== (staged[kind]?.revision ?? null))) {
+      throw new Error("reviewed_release_artifacts_changed");
+    }
+  }
   if (!primaryRelease) throw new Error("release_artifact_not_uploaded");
   const downloadUrl = portableRelease ? artifactDownloadUrl(portableRelease, downloadUrlBase) : "";
   const recordDownloadUrl = artifactDownloadUrl(primaryRelease, downloadUrlBase);
@@ -1831,6 +1861,33 @@ function applyChannelToRoot(manifest, channel, channelManifest) {
   };
 }
 
+async function getCurrentAdminRelease(url, env) {
+  const channel = normalizeChannel(url.searchParams.get("channel"));
+  const manifest = await loadManifest(env);
+  const current = manifest.channels?.[channel] || {};
+  const artifact = (value) => value && typeof value === "object" ? Object.fromEntries(
+    ["url", "sha256", "filename", "size_bytes", "package_type"].filter((key) => Object.hasOwn(value, key)).map((key) => [key, value[key]]),
+  ) : undefined;
+  return {
+    success: true,
+    channel,
+    item: {
+      channel,
+      version: String(current.version || ""),
+      available: Boolean(current.available),
+      disabled: Boolean(current.disabled),
+      disabled_reason: String(current.disabled_reason || ""),
+      published_at: current.published_at || null,
+      mandatory: Boolean(current.mandatory),
+      notes: String(current.notes || ""),
+      filename: String(current.filename || ""),
+      download_url: String(current.download_url || ""),
+      download_sha256: String(current.download_sha256 || ""),
+      artifacts: { installed: artifact(current.artifacts?.installed), portable: artifact(current.artifacts?.portable) },
+    },
+  };
+}
+
 async function getRemoteControls(url, env) {
   const channel = normalizeChannel(url.searchParams.get("channel"));
   const manifest = await loadManifest(env);
@@ -1865,7 +1922,11 @@ async function proxyPolicyAdmin(request, env, targetPath, context = null) {
   };
   if (!["GET", "HEAD"].includes(request.method)) {
     headers["Content-Type"] = "application/json; charset=utf-8";
-    const body = await request.text();
+    const body = ["/v1/admin/global-policy", "/v1/admin/disabled-versions"].includes(targetPath)
+      ? await readBoundedRequestText(request, 4096, "invalid_policy_change", true)
+      : targetPath === "/v1/admin/support/read"
+        ? await readBoundedRequestText(request, 20_000, "invalid_support_read", true)
+        : await request.text();
     init.body = body || "{}";
   }
   const policyRequest = new Request(`${base}${targetPath}`, init);
@@ -1990,25 +2051,21 @@ async function disableRelease(request, env, adminEmail) {
 }
 
 async function getReleaseHistory(env, channel) {
-  if (!hasOtaBucket(env)) return { success: true, events: [] };
+  if (!hasOtaBucket(env)) throw new Error("release_channel_unavailable");
   const manifest = await loadManifest(env);
   const resetAt = Date.parse(String(manifest.history_reset_at || ""));
-  const audit = await loadAudit(env);
-  const filtered = audit
-    .filter((event) => !channel || event.channel === channel)
-    .filter((event) => !Number.isFinite(resetAt) || Date.parse(String(event.at || "")) >= resetAt)
-    .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
-  return { success: true, events: filtered };
+  const events = await loadLegacyAdminAudit(env.OTA_BUCKET, supabaseRequest, env, {
+    channel, resetAt: Number.isFinite(resetAt) ? new Date(resetAt).toISOString() : "", limit: 5000,
+  });
+  return { success: true, events };
 }
 
 async function loadDashboardState(env) {
   const manifest = await loadManifest(env);
   const resetAt = Date.parse(String(manifest.history_reset_at || ""));
-  const audit = await loadAudit(env);
-  const recentEvents = audit
-    .filter((event) => !Number.isFinite(resetAt) || Date.parse(String(event.at || "")) >= resetAt)
-    .slice(-50)
-    .reverse();
+  const recentEvents = hasOtaBucket(env) ? await loadLegacyAdminAudit(env.OTA_BUCKET, supabaseRequest, env, {
+    resetAt: Number.isFinite(resetAt) ? new Date(resetAt).toISOString() : "", limit: 50,
+  }) : [];
   return {
     success: true,
     manifest,
@@ -2016,13 +2073,44 @@ async function loadDashboardState(env) {
   };
 }
 
-async function loadManifest(env) {
-  if (!hasOtaBucket(env)) return structuredClone(DEFAULT_MANIFEST);
-  const existing = await env.OTA_BUCKET.get("updates/latest.json");
+async function loadManifest(env, strict = true) {
+  if (!hasOtaBucket(env)) {
+    if (strict) throw new Error("release_channel_unavailable");
+    return structuredClone(DEFAULT_MANIFEST);
+  }
+  let existing;
+  try { existing = await env.OTA_BUCKET.get("updates/latest.json"); }
+  catch (error) {
+    if (strict) throw new Error("release_channel_unavailable");
+    throw error;
+  }
   if (!existing) return structuredClone(DEFAULT_MANIFEST);
   try {
     const parsed = await existing.json();
-    if (!parsed || typeof parsed !== "object") return structuredClone(DEFAULT_MANIFEST);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid_manifest");
+    if (strict) {
+      const plain = (value) => value && typeof value === "object" && !Array.isArray(value);
+      if (parsed.channels !== undefined && !plain(parsed.channels)) throw new Error("invalid_manifest");
+      for (const value of [parsed, ...CHANNELS.map((channel) => parsed.channels?.[channel]).filter((value) => value !== undefined)]) {
+        if (!plain(value)) throw new Error("invalid_manifest");
+        for (const field of ["available", "mandatory", "disabled"]) {
+          if (value[field] !== undefined && typeof value[field] !== "boolean") throw new Error("invalid_manifest");
+        }
+        for (const field of ["version", "notes", "filename", "download_url", "download_sha256", "disabled_reason"]) {
+          if (value[field] !== undefined && typeof value[field] !== "string") throw new Error("invalid_manifest");
+        }
+        if (value.published_at != null && value.published_at !== "" &&
+            (typeof value.published_at !== "string" || !Number.isFinite(Date.parse(value.published_at)))) throw new Error("invalid_manifest");
+        if (value.artifacts !== undefined && !plain(value.artifacts)) throw new Error("invalid_manifest");
+        for (const kind of ARTIFACT_TYPES) {
+          const artifact = value.artifacts?.[kind];
+          if (artifact == null) continue;
+          if (!plain(artifact)) throw new Error("invalid_manifest");
+          if (["url", "sha256", "filename", "package_type"].some((field) => artifact[field] !== undefined && typeof artifact[field] !== "string")) throw new Error("invalid_manifest");
+          if (artifact.size_bytes !== undefined && (!Number.isSafeInteger(artifact.size_bytes) || artifact.size_bytes < 0)) throw new Error("invalid_manifest");
+        }
+      }
+    }
     return {
       ...structuredClone(DEFAULT_MANIFEST),
       ...parsed,
@@ -2037,6 +2125,7 @@ async function loadManifest(env) {
       },
     };
   } catch {
+    if (strict) throw new Error("release_channel_unavailable");
     return structuredClone(DEFAULT_MANIFEST);
   }
 }
@@ -2121,60 +2210,24 @@ async function recordPublishedOtaUpdate(env, payload) {
       body,
       prefer: "return=representation",
     });
-  } catch (error) {
+  } catch {
     await appendAudit(env, {
       type: "ota_update_record_failed",
       version: body.version,
       channel: body.channel,
-      error: error instanceof Error ? error.message : String(error || "unknown_error"),
+      outcome: "failed",
+      reason_code: "ota_update_record_failed",
       at: new Date().toISOString(),
     });
   }
 }
 
-async function loadAudit(env) {
-  if (!hasOtaBucket(env)) return [];
-  const existing = await env.OTA_BUCKET.get("updates/audit.json");
-  if (!existing) return [];
-  try {
-    const parsed = await existing.json();
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
 async function appendAudit(env, event) {
-  const enriched = {
-    ...event,
-    at: event?.at || new Date().toISOString(),
-  };
-  if (hasOtaBucket(env)) {
-    const list = await loadAudit(env);
-    list.push(enriched);
-    const next = list.slice(-5000);
-    await env.OTA_BUCKET.put("updates/audit.json", JSON.stringify(next, null, 2), {
-      httpMetadata: { contentType: "application/json; charset=utf-8" },
-    });
-  }
-  try {
-    await supabaseRequest(env, "admin_activity", "POST", {
-      body: {
-        action: String(enriched.type || "admin_action").trim(),
-        entity: String(enriched.entity || enriched.channel || "admin").trim(),
-        entity_id: enriched.entity_id || enriched.version || enriched.key || null,
-        payload: enriched,
-        admin_email: enriched.actor || null,
-      },
-      prefer: "return=minimal",
-    });
-  } catch {
-    // R2 audit is the durable fallback when the admin_activity table is not migrated yet.
-  }
+  await deliverAdminAudit(env, supabaseRequest, event);
 }
 
 async function serveLatestManifest(env) {
-  const manifest = await loadManifest(env);
+  const manifest = await loadManifest(env, false);
   const signedManifest = await signManifest(env, manifest);
   return new Response(JSON.stringify(signedManifest, null, 2), {
     status: 200,
@@ -2210,7 +2263,7 @@ function getSupabaseConfig(env) {
   return { baseUrl, serviceKey };
 }
 
-async function supabaseRequest(env, table, method = "GET", { query = "", body = null, prefer = "" } = {}) {
+async function supabaseRequest(env, table, method = "GET", { query = "", body = null, prefer = "", signal } = {}) {
   const { baseUrl, serviceKey } = getSupabaseConfig(env);
   const url = `${baseUrl}/rest/v1/${table}${query ? `?${query}` : ""}`;
   const headers = {
@@ -2223,6 +2276,7 @@ async function supabaseRequest(env, table, method = "GET", { query = "", body = 
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
   const text = await response.text();
   let payload = null;
@@ -2232,9 +2286,15 @@ async function supabaseRequest(env, table, method = "GET", { query = "", body = 
     payload = null;
   }
   if (!response.ok) {
-    throw new Error(payload?.message || payload?.error || `supabase_${response.status}`);
+    throw Object.assign(new Error(payload?.message || payload?.error || `supabase_${response.status}`), {
+      code: typeof payload?.code === "string" ? payload.code : "",
+    });
   }
   return payload;
+}
+
+async function countSupabaseRows(env, table, query) {
+  return (await supabasePage(env, `/${table}?${query}&limit=1`, { method: "HEAD" })).total;
 }
 
 function safeInt(value, fallback = 25, max = 200) {
@@ -2251,7 +2311,7 @@ function safeSearchTerm(value) {
     .slice(0, 100);
 }
 
-function subscriptionResolutionsByUid(rows) {
+function subscriptionResolutionsByUid(rows, now) {
   const grouped = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
     const uid = String(row?.firebase_user_id || "").trim();
@@ -2263,14 +2323,14 @@ function subscriptionResolutionsByUid(rows) {
   return new Map(
     [...grouped.entries()].map(([uid, ownedRows]) => [
       uid,
-      resolveSubscriptionTruth(ownedRows, { firebaseUid: uid }),
+      resolveSubscriptionTruth(ownedRows, { firebaseUid: uid }, { now }),
     ]),
   );
 }
 
-export function subscriptionRowsWithProjection(rows) {
+export function subscriptionRowsWithProjection(rows, relatedRows = rows, now = new Date()) {
   const sourceRows = Array.isArray(rows) ? rows : [];
-  const resolutions = subscriptionResolutionsByUid(sourceRows);
+  const resolutions = subscriptionResolutionsByUid(relatedRows, now);
   return sourceRows.map((row) => {
     const uid = String(row?.firebase_user_id || "").trim();
     if (!uid) {
@@ -2295,50 +2355,48 @@ export function subscriptionRowsWithProjection(rows) {
   });
 }
 
-async function getAdminDashboard(env) {
+async function getAdminDashboard(env, context) {
+  const now = new Date();
   const resources = await Promise.allSettled([
-    safeSupabaseRead(env, "account_profiles", "select=firebase_uid,account_status,created_at,updated_at&limit=1000"),
-    safeSupabaseRead(env, "account_subscriptions", "select=id,firebase_user_id,status,lifecycle_state,plan_term,is_current,integrity_state,expires_at,period_end_at,updated_at,created_at&limit=1000"),
-    safeSupabaseRead(env, "app_sessions", "select=id,user_id,revoked_at,expires_at,last_seen_at,created_at&order=last_seen_at.desc&limit=1000"),
-    safeSupabaseRead(env, "crash_logs", "select=id,error_type,message,fingerprint,happened_at,app_version,user_id&order=happened_at.desc&limit=500"),
-    safeSupabaseRead(env, "tamper_alerts", "select=id,severity,resolved,happened_at,reason,user_id&resolved=is.false&order=happened_at.desc&limit=200"),
-    safeSupabaseRead(env, "admin_activity", "select=id,action,entity,entity_id,admin_email,payload,happened_at&order=happened_at.desc&limit=20"),
+    countSupabaseRows(env, "account_profiles", "select=firebase_uid"),
+    readDashboardEntitlementCount(env, now),
+    countSupabaseRows(env, "app_sessions", `select=id&revoked_at=is.null&expires_at=gt.${encodeURIComponent(now.toISOString())}`),
+    hasPermission(context, "diagnostics:read") ? countSupabaseRows(env, "tamper_alerts", "select=id&resolved=is.false") : Promise.resolve(null),
+    hasPermission(context, "audit:read") ? readAuditRows(env, new URLSearchParams({ limit: "20" })) : Promise.resolve([]),
   ]);
-  const [profiles, subscriptions, sessions, crashes, alerts, activity] = resources.map((result) => result.status === "fulfilled" ? result.value : []);
-  const resolutions = [...subscriptionResolutionsByUid(subscriptions).values()];
-  const activeUsers = resolutions.filter((item) => ["entitled", "grace_period"].includes(item.projection.entitlement)).length;
-  const activeSessions = (Array.isArray(sessions) ? sessions : []).filter((session) => !session.revoked_at && Date.parse(session.expires_at) > Date.now()).length;
-  const unresolvedCrashes = new Set(
-    (Array.isArray(crashes) ? crashes : [])
-      .filter(isActionableCrash)
-      .map((row) => row.fingerprint || `${row.error_type}:${row.message || ""}`),
-  ).size;
-  const degraded = resources.map((result, index) => result.status === "rejected" ? ["profiles", "subscriptions", "sessions", "crashes", "tamper", "activity"][index] : null).filter(Boolean);
+  const [profiles, subscriptions, sessions, alerts, activity] = resources.map((result) => result.status === "fulfilled" ? result.value : null);
+  const degraded = resources.map((result, index) => result.status === "rejected" ? ["profiles", "subscriptions", "sessions", "tamper", "activity"][index] : null).filter(Boolean);
   return {
     success: true,
     kpis: {
-      total_users: Array.isArray(profiles) ? profiles.length : 0,
-      total_active_users: activeUsers,
-      active_sessions: activeSessions,
-      unresolved_crash_groups: unresolvedCrashes,
-      active_tampering_alerts: Array.isArray(alerts) ? alerts.length : 0,
+      total_users: profiles,
+      total_active_users: subscriptions?.count ?? null,
+      active_sessions: sessions,
+      active_tampering_alerts: alerts,
       total_revenue: null,
     },
-    recent_activity: (Array.isArray(activity) ? activity : []).map((item) => ({
-      id: item.id,
-      timestamp: item.happened_at,
-      actor: item.admin_email || null,
-      action: item.action,
-      target_type: item.entity,
-      target_id: item.entity_id,
-      outcome: item.payload?.outcome || "completed",
-      request_id: item.payload?.request_id || null,
-    })),
+    recent_activity: (activity || []).map(projectAuditSummary),
     degraded_resources: degraded,
+    subscription_count_limited: subscriptions?.limited === true,
   };
 }
 
+async function readDashboardEntitlementCount(env, now) {
+  const select = "id,firebase_user_id,status,lifecycle_state,plan_term,starts_at,period_start_at,expires_at,period_end_at,grace_ends_at,cancel_at_period_end,meta_plan_term:metadata->plan_term,meta_plan_intent:metadata->plan_intent,meta_is_unlimited:metadata->is_unlimited,meta_grace_ends_at:metadata->grace_ends_at,meta_cancel_at_period_end:metadata->cancel_at_period_end";
+  const { items: rows, total } = await supabasePage(env, `/account_subscriptions?select=${select}&firebase_user_id=not.is.null&limit=1000`);
+  if (rows.length > total) throw new Error("invalid_dashboard_subscription_rows");
+  if (rows.length < total) return { count: null, limited: true };
+  const records = rows.map(({ meta_plan_term, meta_plan_intent, meta_is_unlimited, meta_grace_ends_at, meta_cancel_at_period_end, ...row }) => ({
+    ...row,
+    metadata: { plan_term: meta_plan_term, plan_intent: meta_plan_intent, is_unlimited: meta_is_unlimited, grace_ends_at: meta_grace_ends_at, cancel_at_period_end: meta_cancel_at_period_end },
+  }));
+  const resolutions = subscriptionResolutionsByUid(records, now);
+  const count = [...resolutions.values()].filter(({ projection }) => ["entitled", "grace_period"].includes(projection.entitlement)).length;
+  return { count, limited: false };
+}
+
 async function listSubscriptions(url, env) {
+  if (url.searchParams.get("view") === "directory") return listSubscriptionDirectory(url, env);
   const limit = safeInt(url.searchParams.get("limit"), 50);
   const page = safeInt(url.searchParams.get("page"), 1, 5000);
   const lifecycle = String(url.searchParams.get("lifecycle") || url.searchParams.get("status") || "").trim().toLowerCase();
@@ -2368,66 +2426,53 @@ async function listSubscriptions(url, env) {
   return { success: true, items: items.slice(offset, offset + limit), total: items.length, page, limit };
 }
 
-async function listAdminUsers(url, env) {
-  const limit = safeInt(url.searchParams.get("limit"), 50, 100);
-  const page = safeInt(url.searchParams.get("page"), 1, 5000);
-  const search = safeSearchTerm(url.searchParams.get("search")).toLowerCase();
-  const accountStatus = String(url.searchParams.get("account_status") || "").trim().toLowerCase();
-  const verification = String(url.searchParams.get("verification") || "").trim().toLowerCase();
-  const subscriptionState = String(url.searchParams.get("subscription") || "").trim().toLowerCase();
-  const sort = String(url.searchParams.get("sort") || "created_desc").trim().toLowerCase();
-  const [profiles, subscriptions, sessions, loginRequests] = await Promise.all([
-    safeSupabaseRead(env, "account_profiles", "select=firebase_uid,normalized_email,display_name,locale,account_status,email_verified,email_verified_at,verification_source,created_at,updated_at&limit=1000"),
-    safeSupabaseRead(env, "account_subscriptions", "select=*&order=created_at.desc&limit=1000"),
-    safeSupabaseRead(env, "app_sessions", "select=id,user_id,hwid,expires_at,revoked_at,created_at,last_seen_at&order=last_seen_at.desc&limit=2000"),
-    safeSupabaseRead(env, "device_login_sessions", "select=id,user_id,hwid,status,expires_at,created_at,authorized_at,consumed_at&order=created_at.desc&limit=2000"),
-  ]);
-  const subscriptionRows = Array.isArray(subscriptions) ? subscriptions : [];
-  const sessionRows = Array.isArray(sessions) ? sessions : [];
-  const loginRows = Array.isArray(loginRequests) ? loginRequests : [];
-  let items = (Array.isArray(profiles) ? profiles : [])
-    .map((profile) => {
-      const uid = String(profile?.firebase_uid || "").trim();
-      const resolution = resolveSubscriptionTruth(subscriptionRows, {
-        firebaseUid: uid,
-        email: normalizeEmail(profile?.normalized_email),
-      });
-      const ownedSessions = sessionRows.filter((row) => row.user_id === uid);
-      const ownedLogins = loginRows.filter((row) => row.user_id === uid);
-      const devices = new Set([...ownedSessions, ...ownedLogins].map((row) => row.hwid).filter(Boolean));
-      const lastActivity = [...ownedSessions.map((row) => row.last_seen_at || row.created_at), ...ownedLogins.map((row) => accessRequestLastEventAt(row))]
-        .filter(Boolean).sort().at(-1) || null;
-      return {
-        ...profile,
-        email: normalizeEmail(profile?.normalized_email),
-        identity_authority: "firebase_uid",
-        subscription_projection: resolution.projection,
-        current_subscription: resolution.current,
-        subscription_integrity: resolution.diagnostics,
-        subscription_presence: resolution.diagnostics.integrity !== "ok" ? "integrity_conflict" : resolution.currentRow ? "active" : resolution.history.length ? "history_only" : "none",
-        session_count: ownedSessions.filter((row) => !row.revoked_at && Date.parse(row.expires_at) > Date.now()).length,
-        device_count: devices.size,
-        last_activity_at: lastActivity,
-      };
-    })
-    .filter((profile) => {
-      if (!search) return true;
-      return [profile.firebase_uid, profile.email, profile.display_name, profile.account_status, profile.subscription_projection?.entitlement]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(search));
+async function listSubscriptionDirectory(url, env) {
+  return (await readSubscriptionDirectory(url, env)).page;
+}
+
+async function readSubscriptionDirectory(url, env) {
+  const recordId = url.searchParams.get("id")?.toLowerCase() ?? null;
+  if (recordId !== null && !isUuid(recordId)) throw new Error("invalid_subscription_directory_query");
+  const ownerUid = url.searchParams.get("owner_uid")?.trim() ?? null;
+  if (ownerUid !== null && (!ownerUid || ownerUid.length > 128 || /[\x00-\x1f\x7f]/.test(ownerUid))) throw new Error("invalid_subscription_directory_query");
+  const input = Object.fromEntries(["search", "lifecycle", "plan_term", "source", "current", "integrity"].map((key) => [key, String(url.searchParams.get(key) || "").trim().toLowerCase()]));
+  const page = Number(url.searchParams.get("page") || 1);
+  const limit = Number(url.searchParams.get("limit") || 25);
+  if (!Number.isSafeInteger(page) || page < 1 || page > 5000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      input.search.length > 200 || /[\x00-\x1f\x7f]/.test(input.search) ||
+      !["", "trialing", "active", "past_due", "cancel_at_period_end", "cancelled", "expired", "suspended", "integrity_conflict"].includes(input.lifecycle) ||
+      !["", "weekly", "monthly", "annual", "lifetime", "custom"].includes(input.plan_term) ||
+      !["", "current", "history"].includes(input.current) || !["", "conflict"].includes(input.integrity) ||
+      input.source.length > 80) throw new Error("invalid_subscription_directory_query");
+  let result;
+  try {
+    result = await supabaseRequest(env, "rpc/admin_subscription_directory", "POST", {
+      body: Object.fromEntries([...Object.entries(input).map(([key, value]) => ["p_" + key, value]), ["p_page", page], ["p_limit", limit],
+        ...(recordId ? [["p_record_id", recordId]] : []), ...(ownerUid ? [["p_owner_uid", ownerUid]] : [])]),
+      signal: AbortSignal.timeout(7000),
     });
-  if (accountStatus) items = items.filter((item) => String(item.account_status).toLowerCase() === accountStatus);
-  if (verification === "verified") items = items.filter((item) => Boolean(item.email_verified || item.email_verified_at));
-  if (verification === "unverified") items = items.filter((item) => !item.email_verified && !item.email_verified_at);
-  if (subscriptionState) items = items.filter((item) => item.subscription_presence === subscriptionState);
-  items.sort((a, b) => {
-    if (sort === "name_asc") return String(a.display_name || a.email).localeCompare(String(b.display_name || b.email));
-    if (sort === "activity_desc") return String(b.last_activity_at || "").localeCompare(String(a.last_activity_at || ""));
-    return String(b.created_at || "").localeCompare(String(a.created_at || ""));
-  });
-  const total = items.length;
-  const offset = (page - 1) * limit;
-  return { success: true, items: items.slice(offset, offset + limit), total, page, limit };
+  } catch { throw new Error("subscriptions_unavailable"); }
+  const validRow = (row) => isUuid(row?.id) && typeof row.user_email === "string";
+  if (!Number.isSafeInteger(result?.total) || result.total < 0 || !Number.isFinite(Date.parse(result.as_of)) ||
+      !Array.isArray(result.items) || result.items.length > limit || !result.items.every(validRow) ||
+      !Array.isArray(result.witnesses) || result.witnesses.length > limit * 3 || !result.witnesses.every(validRow) ||
+      result.items.length !== Math.min(limit, Math.max(0, result.total - (page - 1) * limit)) ||
+      new Set(result.items.map(({ id }) => id)).size !== result.items.length ||
+      (recordId && (result.total > 1 || result.items.some((row) => row.id !== recordId))) ||
+      (ownerUid && result.items.some((row) => String(row.firebase_user_id || "").trim() !== ownerUid))) throw new Error("subscriptions_unavailable");
+  const owners = new Set(result.items.map((row) => String(row.firebase_user_id || "").trim()).filter(Boolean));
+  if (result.witnesses.some((row) => !owners.has(String(row.firebase_user_id || "").trim()))) throw new Error("subscriptions_unavailable");
+  const publicKeys = ["id", "firebase_user_id", "user_email", "plan", "tier", "status", "lifecycle_state", "plan_term", "renewal_state", "provider", "source_type",
+    "starts_at", "expires_at", "period_start_at", "period_end_at", "trial_starts_at", "trial_ends_at", "grace_ends_at", "cancel_at_period_end", "is_current", "created_at", "updated_at",
+    "identity_authority", "is_current_record", "is_current_projection", "subscription_projection", "integrity_warning"];
+  const at = new Date(result.as_of);
+  const items = subscriptionRowsWithProjection(result.items, result.witnesses, at).map((row) => ({
+    ...Object.fromEntries(publicKeys.filter((key) => row[key] !== undefined).map((key) => [key, row[key]])),
+    effective_lifecycle: subscriptionLifecycle(row, at) ?? "scheduled",
+    plan_term: subscriptionPlanTerm(row),
+  }));
+  return { page: { success: true, view: "directory", items, total: result.total, page, limit },
+    resolutionRows: [...new Map([...result.items, ...result.witnesses].map((row) => [row.id, row])).values()], at };
 }
 
 function manualGrantRequestId() {
@@ -2660,12 +2705,17 @@ async function resolveManualGrantTarget(env, input) {
   const profileFilter = input.target_firebase_uid
     ? `firebase_uid=eq.${encodeURIComponent(input.target_firebase_uid)}`
     : `normalized_email=eq.${encodeURIComponent(input.target_email)}`;
-  const profiles = await safeSupabaseRead(
-    env,
-    "account_profiles",
-    `select=firebase_uid,normalized_email,display_name,locale,account_status,updated_at&${profileFilter}&limit=2`,
-  );
-  if (!Array.isArray(profiles) || profiles.length === 0) {
+  let profiles;
+  try {
+    profiles = await supabaseRequest(env, "account_profiles", "GET", {
+      query: `select=firebase_uid,normalized_email,display_name,locale,account_status,updated_at&${profileFilter}&limit=2`,
+    });
+  } catch {
+    throw new Error("admin_users_unavailable");
+  }
+  if (!Array.isArray(profiles)) throw new Error("admin_users_unavailable");
+  if (profiles.length === 0) {
+    if (input.target_firebase_uid) throw new Error("manual_grant_target_changed");
     if (!input.target_email) throw new Error("account_not_found");
     return {
       target: {
@@ -2686,17 +2736,24 @@ async function resolveManualGrantTarget(env, input) {
   }
   if (profiles.length > 1) throw new Error("account_identity_conflict");
   const profile = profiles[0];
-  const targetUid = String(profile.firebase_uid || "").trim();
-  if (!targetUid) throw new Error("firebase_uid_required");
+  const targetUid = String(profile?.firebase_uid || "").trim();
+  const targetEmail = normalizeEmail(profile?.normalized_email);
+  if (!targetUid || !targetEmail) throw new Error("admin_users_unavailable");
+  if ((input.target_firebase_uid && targetUid !== input.target_firebase_uid) ||
+      (input.target_email && targetEmail !== input.target_email)) throw new Error("manual_grant_target_changed");
   if (profile.account_status !== "active") throw new Error("account_not_active");
-  const rows = await safeSupabaseRead(
-    env,
-    "account_subscriptions",
-    `select=*&firebase_user_id=eq.${encodeURIComponent(targetUid)}&order=created_at.desc&limit=100`,
-  );
-  const candidates = Array.isArray(rows) ? rows : [];
+  let candidates;
+  try {
+    const query = new URLSearchParams({ select: "*", firebase_user_id: `eq.${targetUid}`, order: "created_at.desc,id.desc", limit: "1000" });
+    const page = await supabasePage(env, `/account_subscriptions?${query}`, { signal: AbortSignal.timeout(12000) });
+    if (page.items.length !== page.total ||
+        page.items.some((row) => row?.firebase_user_id !== targetUid || typeof row.id !== "string" || !row.id.trim()) ||
+        new Set(page.items.map((row) => row.id)).size !== page.items.length) throw new Error("incomplete_subscription_history");
+    candidates = page.items;
+  } catch {
+    throw new Error("manual_grant_subscription_history_unavailable");
+  }
   const sorted = manualGrantSortRows(candidates);
-  const targetEmail = normalizeEmail(profile.normalized_email);
   const resolution = resolveSubscriptionTruth(sorted, { firebaseUid: targetUid, email: targetEmail });
   const ownedRows = sorted.filter((row) => String(row?.firebase_user_id || "").trim() === targetUid);
   const usable = resolution?.currentRow ? [resolution.currentRow] : [];
@@ -3159,6 +3216,24 @@ async function executeManualSubscriptionGrant(request, env, adminEmail) {
 async function listPendingSubscriptionGrants(url, env) {
   const status = String(url.searchParams.get("status") || "pending").trim().toLowerCase();
   if (!["pending", "claimed", "cancelled", "expired", "all"].includes(status)) throw new Error("invalid_pending_grant_status");
+  if (url.searchParams.get("view") === "directory") {
+    const page = Number(url.searchParams.get("page") || 1);
+    const limit = Number(url.searchParams.get("limit") || 5);
+    if (!Number.isSafeInteger(page) || page < 1 || page > 5000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("invalid_pending_grant_query");
+    }
+    const query = new URLSearchParams({
+      select: "id,normalized_email,status,plan_term,duration_mode,duration_value,duration_unit,exact_expiry,claim_deadline,created_at,updated_at",
+      order: "created_at.desc,id.asc", limit: String(limit), offset: String((page - 1) * limit),
+    });
+    if (status !== "all") query.set("status", "eq." + status);
+    try {
+      const result = await supabasePage(env, "/pending_subscription_grants?" + query);
+      if (!Array.isArray(result.items) || result.items.length !== Math.min(limit, Math.max(0, result.total - (page - 1) * limit)) ||
+          !result.items.every((item) => isUuid(item?.id) && typeof item.normalized_email === "string" && (status === "all" || item.status === status))) throw new Error();
+      return { success: true, view: "directory", items: result.items, total: result.total, page, limit };
+    } catch { throw new Error("pending_grants_unavailable"); }
+  }
   const limit = safeInt(url.searchParams.get("limit"), 100, 200);
   const filter = status === "all" ? "" : `&status=eq.${encodeURIComponent(status)}`;
   let items;
@@ -3339,48 +3414,47 @@ async function updateSubscription(subscriptionId, request, env, adminEmail) {
   return { success: true, item, auto_authorized_requests: autoAuthorized };
 }
 
-async function resetSubscriptionHwid(subscriptionId, request, env, adminEmail) {
-  if (!subscriptionId) throw new Error("missing_subscription_id");
-  const body = await request.json().catch(() => ({}));
-  const revokeSessions = body?.revoke_sessions !== false;
-  const updated = await supabaseRequest(env, "account_subscriptions", "PATCH", {
-    query: `id=eq.${encodeURIComponent(subscriptionId)}&select=*`,
-    body: {
-      hwid: null,
-      bound_at: null,
-      metadata: { reset_hwid_by: adminEmail, reset_hwid_at: new Date().toISOString() },
-    },
-    prefer: "return=representation",
-  });
-  if (revokeSessions) {
-    await supabaseRequest(env, "app_sessions", "PATCH", {
-      query: `subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
-      body: { revoked_at: new Date().toISOString() },
-      prefer: "return=minimal",
-    }).catch(() => null);
-  }
-  const item = Array.isArray(updated) ? updated[0] : updated;
-  await appendAudit(env, {
-    type: "subscription_reset_hwid",
-    entity: "account_subscriptions",
-    entity_id: subscriptionId,
-    actor: adminEmail,
-    payload: { revoke_sessions: revokeSessions },
-    at: new Date().toISOString(),
-  });
-  return { success: true, item };
+const PROMO_PUBLIC_FIELDS = "id,code,title,discount_type,discount_value,currency,is_private_tier_trigger,is_active,max_uses,used_count,starts_at,expires_at,created_at,updated_at,effective_status";
+function publicPromoRecord(item) {
+  return Object.fromEntries(PROMO_PUBLIC_FIELDS.split(",").map((key) => [key, item[key]]));
 }
 
 async function listPromoCodes(url, env) {
+  if (url.searchParams.get("view") === "management") {
+    const rawPage = url.searchParams.get("page") || "1";
+    const rawLimit = url.searchParams.get("limit") || "25";
+    const page = Number(rawPage);
+    const limit = Number(rawLimit);
+    const status = String(url.searchParams.get("status") || "").trim();
+    const query = String(url.searchParams.get("query") || "").trim();
+    if (!/^[1-9][0-9]*$/.test(rawPage) || !Number.isSafeInteger(page) || page > 5000 ||
+        !/^[1-9][0-9]*$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit > 100 || query.length > 100 ||
+        (status && !["active", "paused", "scheduled", "expired", "exhausted"].includes(status))) throw new Error("invalid_promo_filter");
+    const params = new URLSearchParams({
+      select: PROMO_PUBLIC_FIELDS,
+      order: "created_at.desc,id.desc", limit: String(limit + 1), offset: String((page - 1) * limit),
+    });
+    if (status) params.set("effective_status", "eq." + status);
+    if (query) params.set("code", "ilike.%" + query.replace(/[\\%_*]/g, "\\$&") + "%");
+    let rows;
+    try {
+      rows = await supabaseRequest(env, "admin_promo_code_directory", "GET", { query: params.toString() });
+      if (!Array.isArray(rows) || rows.some((row) => !isUuid(row?.id) || typeof row.code !== "string" ||
+          !["active", "paused", "scheduled", "expired", "exhausted"].includes(row.effective_status))) throw new Error("invalid_promo_directory");
+    } catch { throw new Error("promo_codes_unavailable"); }
+    return { success: true, items: rows.slice(0, limit).map(publicPromoRecord), page, limit, has_more: rows.length > limit, query, status, generated_at: new Date().toISOString() };
+  }
   const limit = safeInt(url.searchParams.get("limit"), 100);
   const data = await supabaseRequest(env, "promo_codes", "GET", {
-    query: `select=*&order=created_at.desc&limit=${limit}`,
+    query: `select=${PROMO_PUBLIC_FIELDS.replace(",effective_status", "")}&order=created_at.desc,id.desc&limit=${limit}`,
   });
-  return { success: true, items: data || [] };
+  if (!Array.isArray(data)) throw new Error("promo_codes_unavailable");
+  return { success: true, items: data.map(publicPromoRecord) };
 }
 
 async function createPromoCode(request, env, adminEmail) {
   const body = await request.json();
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid_promo_code");
   const payload = {
     code: String(body?.code || "").trim(),
     title: String(body?.title || "").trim() || null,
@@ -3395,36 +3469,48 @@ async function createPromoCode(request, env, adminEmail) {
     metadata: { ...(body?.metadata && typeof body.metadata === "object" ? body.metadata : {}), created_by: adminEmail },
   };
   if (!payload.code) throw new Error("missing_code");
-  const created = await supabaseRequest(env, "promo_codes", "POST", {
-    body: payload,
-    prefer: "return=representation",
-  });
+  if (payload.code.length > 64 || /[\x00-\x1f\x7f]/.test(payload.code)) throw new Error("invalid_promo_code");
+  if (!["percent", "fixed"].includes(payload.discount_type) || !Number.isFinite(payload.discount_value) ||
+      payload.discount_value < 0 || (!payload.is_private_tier_trigger && payload.discount_value === 0) ||
+      payload.discount_value >= 10000000000 || (payload.discount_type === "percent" && payload.discount_value > 100) ||
+      !/^\d+(?:\.\d{1,2})?$/.test(String(payload.discount_value))) throw new Error("invalid_promo_discount");
+  if (body.max_uses !== undefined && body.max_uses !== null && body.max_uses !== "" &&
+      (!Number.isSafeInteger(Number(body.max_uses)) || Number(body.max_uses) < 1 || Number(body.max_uses) > 2147483647)) throw new Error("invalid_promo_max_uses");
+  if (payload.expires_at && (!Number.isFinite(Date.parse(payload.expires_at)) || Date.parse(payload.expires_at) <= Date.now())) throw new Error("invalid_promo_expiry");
+  if (body.is_active !== undefined && typeof body.is_active !== "boolean") throw new Error("invalid_promo_state");
+  if (body.is_private_tier_trigger !== undefined && typeof body.is_private_tier_trigger !== "boolean") throw new Error("invalid_promo_code");
+  let created;
+  try {
+    created = await supabaseRequest(env, "rpc/admin_create_promo_code", "POST", { body: { p_data: payload, p_actor: adminEmail } });
+  } catch (error) {
+    if (error?.code === "23505") throw new Error("promo_code_exists");
+    throw new Error("promo_save_unconfirmed");
+  }
   const item = Array.isArray(created) ? created[0] : created;
-  await appendAudit(env, {
-    type: "promo_code_create",
-    entity: "promo_codes",
-    entity_id: item?.id || null,
-    actor: adminEmail,
-    payload: { code_hint: payload.code.slice(-4), discount_type: payload.discount_type, private_tier: payload.is_private_tier_trigger },
-    at: new Date().toISOString(),
-  });
-  return { success: true, item };
+  if (!isUuid(item?.id) || item.code !== payload.code) throw new Error("promo_save_unconfirmed");
+  return { success: true, item: publicPromoRecord(item) };
 }
 
 async function updatePromoCodeState(promoId, request, env, adminEmail) {
   if (!isUuid(promoId)) throw new Error("invalid_promo_code");
   const body = await request.json();
-  const active = Boolean(body?.active);
+  if (typeof body?.active !== "boolean") throw new Error("invalid_promo_state");
+  const active = body.active;
+  const expectedUpdatedAt = String(body.expected_updated_at || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(expectedUpdatedAt) || !Number.isFinite(Date.parse(expectedUpdatedAt))) throw new Error("promo_review_required");
   const reason = String(body?.reason || "").trim().slice(0, 1000);
   if (reason.length < 3) throw new Error("reason_required");
-  const rows = await supabaseRequest(env, "promo_codes", "PATCH", {
-    query: `id=eq.${encodeURIComponent(promoId)}&select=id,code,discount_type,discount_value,is_active,max_uses,used_count,expires_at`,
-    body: { is_active: active, updated_at: new Date().toISOString() },
-    prefer: "return=representation",
-  });
-  if (!Array.isArray(rows) || !rows.length) throw new Error("promo_code_not_found");
-  await appendAudit(env, { type: active ? "promo_code_activated" : "promo_code_deactivated", entity: "promo_codes", entity_id: promoId, actor: adminEmail, payload: { reason }, at: new Date().toISOString() });
-  return { success: true, item: rows[0] };
+  let item;
+  try {
+    item = await supabaseRequest(env, "rpc/admin_set_promo_code_state", "POST", {
+      body: { p_id: promoId, p_active: active, p_expected_updated_at: expectedUpdatedAt, p_actor: adminEmail, p_reason: reason },
+    });
+  } catch (error) {
+    if (error?.message === "promo_code_changed") throw error;
+    throw new Error("promo_save_unconfirmed");
+  }
+  if (item?.id !== promoId || item.is_active !== active) throw new Error("promo_save_unconfirmed");
+  return { success: true, item: publicPromoRecord(item) };
 }
 
 async function listOtaUpdates(url, env) {
@@ -3459,13 +3545,18 @@ async function listOtaUpdates(url, env) {
   return { success: true, items: publicItems.slice(0, limit) };
 }
 
-async function getAdminCommerceOverview(env) {
+async function getAdminCommerceOverview(env, context) {
+  const legacyRead = async (table, query) => {
+    try { const rows = await supabaseRequest(env, table, "GET", { query, signal: AbortSignal.timeout(12000) }); if (Array.isArray(rows)) return rows; }
+    catch { throw new Error("commerce_unavailable"); }
+    throw new Error("commerce_unavailable");
+  };
   const [plans, orders, integrityEvents, releases, accessLogs] = await Promise.all([
-    safeSupabaseRead(env, "commercial_plans", "select=plan_id,version,display_name,term,price_minor,original_price_minor,currency,active,public_visible,purchasable,provider,trial_days,config_status,updated_at&order=display_order.asc,plan_id.asc,version.desc&limit=100"),
-    safeSupabaseRead(env, "commercial_orders", "select=id,firebase_uid,plan_id,plan_version,status,currency,amount_minor,provider,created_at,updated_at,expires_at&order=created_at.desc&limit=100"),
-    safeSupabaseRead(env, "subscription_integrity_events", "select=id,firebase_uid,subscription_id,code,severity,source,resolved_at,created_at&resolved_at=is.null&order=created_at.desc&limit=100"),
-    safeSupabaseRead(env, "download_releases", "select=id,version,channel,platform,architecture,filename,size_bytes,sha256,active,published_at,created_at&order=created_at.desc&limit=100"),
-    safeSupabaseRead(env, "download_access_logs", "select=id,release_id,firebase_uid,decision,entitlement,request_id,created_at&order=created_at.desc&limit=100"),
+    legacyRead("commercial_plans", "select=plan_id,version,display_name,term,price_minor,original_price_minor,currency,active,public_visible,purchasable,provider,trial_days,config_status,updated_at&order=display_order.asc,plan_id.asc,version.desc&limit=100"),
+    legacyRead("commercial_orders", "select=id,firebase_uid,plan_id,plan_version,status,currency,amount_minor,provider,created_at,updated_at,expires_at&order=created_at.desc&limit=100"),
+    legacyRead("subscription_integrity_events", "select=id,firebase_uid,subscription_id,code,severity,source,resolved_at,created_at&resolved_at=is.null&order=created_at.desc&limit=100"),
+    hasPermission(context, "releases:read") ? legacyRead("download_releases", "select=id,version,channel,platform,architecture,filename,size_bytes,sha256,active,published_at,created_at&order=created_at.desc&limit=100") : Promise.resolve([]),
+    hasPermission(context, "releases:read") && hasPermission(context, "audit:read") ? legacyRead("download_access_logs", "select=id,release_id,firebase_uid,decision,entitlement,request_id,created_at&order=created_at.desc&limit=100") : Promise.resolve([]),
   ]);
   const providerStatus = {
     stripe: Boolean(String(env.STRIPE_SECRET_KEY || "").trim()),
@@ -3476,10 +3567,8 @@ async function getAdminCommerceOverview(env) {
   return {
     success: true,
     provider_status: providerStatus,
-    checkout_available: planRows.some((plan) => {
-      const provider = String(plan?.provider || "").trim().toLowerCase();
-      return Boolean(plan?.active && plan?.public_visible && plan?.purchasable && provider && providerStatus[provider]);
-    }),
+    checkout_available: commerceConfiguration(env).checkout_available,
+    sample_only: true,
     reconciliation_status: orderRows.length ? "provider_integration_required" : "no_provider_orders",
     plans: planRows,
     orders: orderRows,
@@ -3523,6 +3612,28 @@ async function createOtaUpdate(request, env, adminEmail) {
 
 const DIAGNOSTIC_RETENTION_DAYS = 90;
 const DIAGNOSTIC_SELECT = "id,happened_at,user_id,subscription_id,hwid,device_name,windows_version,cpu,gpu,ram_gb,error_type,message,stack_trace,app_version,tool_channel,fingerprint,raw_payload";
+const TRIAGE_SCAN_LIMIT = 100;
+const DIAGNOSTIC_CLASSIFICATION_SELECT = [
+  "error_type,message,stack_trace,context:raw_payload->>context,severity:raw_payload->>severity",
+  "trace_format:raw_payload->trace->>format,trace_run:raw_payload->trace->>run_id,trace_parent:raw_payload->trace->>parent_event_id",
+].join(",");
+const TRIAGE_SELECT = [
+  "id,happened_at,hwid,app_version,fingerprint",
+  "source:raw_payload->>source,component:raw_payload->>component",
+  "occurrences:raw_payload->>occurrence_count,first_seen:raw_payload->>first_happened_at,last_seen:raw_payload->>last_happened_at",
+  "auth_source:raw_payload->auth->>source,attribution:raw_payload->auth->>attribution,operator_id:raw_payload->auth->>firebase_user_id",
+  DIAGNOSTIC_CLASSIFICATION_SELECT,
+].join(",");
+
+async function readDiagnosticRows(env, table, query) {
+  try {
+    const rows = await supabaseRequest(env, table, "GET", { query });
+    if (Array.isArray(rows)) return rows;
+  } catch {
+    throw new Error("diagnostics_unavailable");
+  }
+  throw new Error("diagnostics_unavailable");
+}
 
 function diagnosticCutoff(now = Date.now()) {
   return new Date(now - DIAGNOSTIC_RETENTION_DAYS * 86400000).toISOString();
@@ -3541,18 +3652,18 @@ export async function purgeExpiredDiagnostics(env, now = Date.now()) {
   return { success: true, retention_days: DIAGNOSTIC_RETENTION_DAYS };
 }
 
-function diagnosticCursor(row) {
+function timestampedCursor(row) {
   return btoa(JSON.stringify({ at: row.happened_at, id: row.id }));
 }
 
-function parseDiagnosticCursor(value) {
+function parseTimestampedCursor(value, errorCode) {
   if (!value) return null;
   try {
     const parsed = JSON.parse(atob(String(value)));
     if (!isUuid(parsed.id) || typeof parsed.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(parsed.at) || !Number.isFinite(Date.parse(parsed.at))) throw new Error();
     return { id: parsed.id, at: parsed.at };
   } catch {
-    throw new Error("invalid_diagnostic_cursor");
+    throw new Error(errorCode);
   }
 }
 
@@ -3568,13 +3679,13 @@ async function diagnosticOperatorScope(value, env) {
   if (!key) return null;
   if (key.length > 254 || /[\x00-\x20,()"\\]/.test(key)) throw new Error("invalid_diagnostic_user");
   const field = key.includes("@") ? "normalized_email" : "firebase_uid";
-  const profiles = await safeSupabaseRead(env, "account_profiles", `select=firebase_uid,normalized_email,display_name&${field}=eq.${encodeURIComponent(field === "normalized_email" ? normalizeEmail(key) : key)}&limit=2`);
+  const profiles = await readDiagnosticRows(env, "account_profiles", `select=firebase_uid,normalized_email,display_name&${field}=eq.${encodeURIComponent(field === "normalized_email" ? normalizeEmail(key) : key)}&limit=2`);
   if (profiles.length > 1) throw new Error("account_identity_conflict");
   if (!profiles.length) return { missing: true };
   const profile = profiles[0];
   const subscriptionIds = [];
   for (let page = 0; page < 50; page += 1) {
-    const rows = await safeSupabaseRead(env, "account_subscriptions", `select=id&firebase_user_id=eq.${encodeURIComponent(profile.firebase_uid)}&order=id&limit=200&offset=${page * 200}`);
+    const rows = await readDiagnosticRows(env, "account_subscriptions", `select=id&firebase_user_id=eq.${encodeURIComponent(profile.firebase_uid)}&order=id&limit=200&offset=${page * 200}`);
     subscriptionIds.push(...rows.map((row) => row.id).filter(isUuid));
     if (rows.length < 200) return { profile, subscriptionIds };
   }
@@ -3645,12 +3756,9 @@ async function projectDiagnosticRows(rows, env, { detail = false } = {}) {
   });
 }
 
-export async function listCrashLogs(url, env) {
-  const limit = safeInt(url.searchParams.get("limit"), 50, 200);
-  const requested = String(url.searchParams.get("classification") || "all").toLowerCase();
-  const classification = ["error", "warning", "all"].includes(requested) ? requested : "all";
+async function buildDiagnosticFilters(url, env) {
   const scope = await diagnosticOperatorScope(url.searchParams.get("user"), env);
-  if (scope?.missing) return { success: true, items: [], limit, has_more: false, next_cursor: null, retention_days: DIAGNOSTIC_RETENTION_DAYS };
+  if (scope?.missing) return null;
   const filters = [`happened_at=gte.${encodeURIComponent(diagnosticCutoff())}`];
   if (scope) filters.push(diagnosticScopeFilter(scope));
   const search = safeSearchTerm(url.searchParams.get("search"));
@@ -3663,7 +3771,16 @@ export async function listCrashLogs(url, env) {
   const attribution = url.searchParams.get("attribution");
   if (attribution === "verified") filters.push("raw_payload->auth->>attribution=eq.verified");
   if (attribution === "unattributed") filters.push("or=(raw_payload->auth->>attribution.is.null,raw_payload->auth->>attribution.neq.verified)");
-  let cursor = parseDiagnosticCursor(url.searchParams.get("cursor"));
+  return filters;
+}
+
+export async function listCrashLogs(url, env) {
+  const limit = safeInt(url.searchParams.get("limit"), 50, 200);
+  const requested = String(url.searchParams.get("classification") || "all").toLowerCase();
+  const classification = ["error", "warning", "all"].includes(requested) ? requested : "all";
+  const filters = await buildDiagnosticFilters(url, env);
+  if (!filters) return { success: true, items: [], limit, has_more: false, next_cursor: null, retention_days: DIAGNOSTIC_RETENTION_DAYS };
+  let cursor = parseTimestampedCursor(url.searchParams.get("cursor"), "invalid_diagnostic_cursor");
   const selected = [];
   let lastScanned = null;
   let hasMore = false;
@@ -3671,7 +3788,7 @@ export async function listCrashLogs(url, env) {
   for (let batch = 0; batch < 5 && selected.length < limit; batch += 1) {
     const pageFilters = [...filters];
     if (cursor) pageFilters.push(`or=(happened_at.lt.${encodeURIComponent(cursor.at)},and(happened_at.eq.${encodeURIComponent(cursor.at)},id.lt.${cursor.id}))`);
-    const data = await safeSupabaseRead(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&order=happened_at.desc,id.desc&limit=200&${diagnosticFilterQuery(pageFilters)}`);
+    const data = await readDiagnosticRows(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&order=happened_at.desc,id.desc&limit=200&${diagnosticFilterQuery(pageFilters)}`);
     hasMore = data.length === 200;
     for (let index = 0; index < data.length; index += 1) {
       const row = data[index];
@@ -3690,14 +3807,14 @@ export async function listCrashLogs(url, env) {
     success: true,
     items: await projectDiagnosticRows(selected, env),
     limit, classification, has_more: hasMore,
-    next_cursor: hasMore && lastScanned ? diagnosticCursor(lastScanned) : null,
+    next_cursor: hasMore && lastScanned ? timestampedCursor(lastScanned) : null,
     retention_days: DIAGNOSTIC_RETENTION_DAYS,
   };
 }
 
 export async function getCrashLog(id, env) {
   if (!isUuid(id)) throw new Error("invalid_diagnostic_id");
-  const rows = await safeSupabaseRead(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&id=eq.${id}&happened_at=gte.${encodeURIComponent(diagnosticCutoff())}&limit=1`);
+  const rows = await readDiagnosticRows(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&id=eq.${id}&happened_at=gte.${encodeURIComponent(diagnosticCutoff())}&limit=1`);
   if (!rows.length) throw new Error("diagnostic_not_found");
   const item = (await projectDiagnosticRows(rows, env, { detail: true }))[0];
   const trace = item.technical_context.trace;
@@ -3707,8 +3824,13 @@ export async function getCrashLog(id, env) {
       return { success: true, item };
     }
     const followupId = await diagnosticStorageId(trace.followup_event_id);
-    const followups = await safeSupabaseRead(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&id=eq.${followupId}&happened_at=gte.${encodeURIComponent(diagnosticCutoff())}&limit=1`);
-    const followup = followups[0];
+    let followup;
+    try {
+      [followup] = await readDiagnosticRows(env, "crash_logs", `select=${DIAGNOSTIC_SELECT}&id=eq.${followupId}&happened_at=gte.${encodeURIComponent(diagnosticCutoff())}&limit=1`);
+    } catch {
+      item.technical_context.trace_followup_status = "unavailable";
+      return { success: true, item };
+    }
     if (followup) {
       const related = diagnosticTrace(followup.raw_payload?.trace);
       const sameOwner = verifiedDiagnosticUid(followup) === verifiedDiagnosticUid(rows[0]);
@@ -3798,15 +3920,6 @@ async function findExistingSubscriptionForIdentity(env, { userEmail, firebaseUse
   const durableCurrentRows = ownedRows.filter((row) => row?.is_current === true);
   if (durableCurrentRows.length > 1) throw new Error("subscription_integrity_conflict");
   return resolution.currentRow || durableCurrentRows[0] || null;
-}
-
-export function subscriptionDiagnosticFilter(rows) {
-  const subscriptionIds = (Array.isArray(rows) ? rows : [])
-    .map((row) => String(row?.id || "").trim())
-    .filter(Boolean);
-  return subscriptionIds.length
-    ? `subscription_id=in.(${subscriptionIds.map((id) => encodeURIComponent(id)).join(",")})`
-    : "";
 }
 
 function pickMatchingSubscription(row, subscriptions) {
@@ -3932,13 +4045,26 @@ async function crashFingerprint(row) {
 export async function listCrashGroups(url, env) {
   const statusFilter = String(url.searchParams.get("status") || "").trim().toLowerCase();
   const page = await listCrashLogs(url, env);
-  const fingerprints = await Promise.all(page.items.map(crashFingerprint));
-  const uniqueFingerprints = [...new Set(fingerprints)];
-  const states = uniqueFingerprints.length ? await safeSupabaseRead(env, "admin_crash_group_state", `select=fingerprint,status,assignee,note,updated_by,updated_at&fingerprint=in.(${uniqueFingerprints.map(encodeURIComponent).join(",")})&limit=200`) : [];
-  const statesByFingerprint = new Map((Array.isArray(states) ? states : []).map((state) => [state.fingerprint, state]));
+  const items = await summarizeDiagnosticGroups(page.items, env);
+  return {
+    success: true,
+    items: statusFilter ? items.filter((group) => group.status === statusFilter) : items,
+    has_more: page.has_more,
+    next_cursor: page.next_cursor,
+    summarized_reports: page.items.length,
+    retention_days: DIAGNOSTIC_RETENTION_DAYS,
+  };
+}
+
+async function summarizeDiagnosticGroups(items, env, verifiedOnly = false) {
+  const fingerprints = [...new Set(items.map((row) => row.fingerprint))];
+  if (!fingerprints.length) return [];
+  const states = await readDiagnosticRows(env, "admin_crash_group_state", `select=fingerprint,status,assignee,note,updated_at&fingerprint=in.(${fingerprints.map(encodeURIComponent).join(",")})&limit=${fingerprints.length}`);
+  const statesByFingerprint = new Map(states.map((state) => [state.fingerprint, state]));
   const groups = new Map();
-  for (const row of page.items) {
-    const fingerprint = await crashFingerprint(row);
+  for (const row of items) {
+    const fingerprint = row.fingerprint;
+    const userKey = row.user_id || (!verifiedOnly && row.subscription_id);
     const existing = groups.get(fingerprint);
     if (!existing) {
       const state = statesByFingerprint.get(fingerprint) || {};
@@ -3947,6 +4073,7 @@ export async function listCrashGroups(url, env) {
         count: row.occurrence_count,
         first_seen_at: row.first_happened_at,
         last_seen_at: row.last_happened_at,
+        latest_report_id: row.id,
         error_type: row.error_type,
         message: sanitizeCrashString(row.message || ""),
         status: state.status || "open",
@@ -3954,7 +4081,7 @@ export async function listCrashGroups(url, env) {
         note: state.note || null,
         state_updated_at: state.updated_at || null,
         affected_hwids: new Set(row.hwid ? [row.hwid] : []),
-        affected_users: new Set(row.user_id || row.subscription_id ? [row.user_id || row.subscription_id] : []),
+        affected_users: new Set(userKey ? [userKey] : []),
         affected_versions: new Set(row.app_version ? [row.app_version] : []),
       });
       continue;
@@ -3962,92 +4089,209 @@ export async function listCrashGroups(url, env) {
     existing.count += row.occurrence_count;
     if (String(row.last_happened_at || "") > String(existing.last_seen_at || "")) {
       existing.last_seen_at = row.last_happened_at;
+      existing.latest_report_id = row.id;
     }
     if (String(row.first_happened_at || "") < String(existing.first_seen_at || "")) existing.first_seen_at = row.first_happened_at;
     if (row.hwid) existing.affected_hwids.add(row.hwid);
-    const userKey = row.user_id || row.subscription_id;
     if (userKey) existing.affected_users.add(userKey);
     if (row.app_version) existing.affected_versions.add(row.app_version);
   }
-  let items = [...groups.values()].map((group) => ({
+  return [...groups.values()].map((group) => ({
     ...group,
     affected_device_count: group.affected_hwids.size,
     affected_user_count: group.affected_users.size,
     affected_versions: [...group.affected_versions].sort(),
     affected_hwids: undefined,
     affected_users: undefined,
-  }));
-  if (statusFilter) items = items.filter((group) => group.status === statusFilter);
+  })).sort((a, b) => String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || "")) || a.fingerprint.localeCompare(b.fingerprint));
+}
+
+function triageRow(row) {
+  return {
+    ...row,
+    raw_payload: {
+      source: row.source,
+      component: row.component,
+      context: row.context,
+      severity: row.severity,
+      trace: { format: row.trace_format, run_id: row.trace_run, parent_event_id: row.trace_parent },
+      auth: { source: row.auth_source, attribution: row.attribution, firebase_user_id: row.operator_id },
+    },
+  };
+}
+
+function diagnosticCoverageVersion(value) {
+  const label = String(value || "").trim();
+  return label.length <= 40 && /^v?\d{1,6}(?:\.\d{1,6}){1,3}(?:-[a-z0-9.]{1,16})?$/i.test(label) ? label : null;
+}
+
+async function readDiagnosticCoverage(url, env) {
+  const now = Date.now();
+  const params = url.searchParams;
+  const custom = params.has("from") || params.has("to");
+  const daysParam = params.get("days") ?? "7";
+  if ((custom && params.has("days")) || (!custom && !["7", "30", "90"].includes(daysParam))) throw new Error("invalid_diagnostic_window");
+  const days = custom ? null : Number(daysParam);
+  const cutoff = now - DIAGNOSTIC_RETENTION_DAYS * 86400000;
+  const parseBoundary = (key) => {
+    const value = params.get(key);
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) throw new Error("invalid_diagnostic_window");
+    return timestamp;
+  };
+  const start = custom ? parseBoundary("from") : now - days * 86400000;
+  const end = custom ? parseBoundary("to") : now;
+  if (start > now || end <= start || end <= cutoff || end > now + 27 * 3600000) throw new Error("invalid_diagnostic_window");
+  const from = new Date(Math.max(start, cutoff)).toISOString();
+  const to = new Date(Math.min(end, now)).toISOString();
+  const endOperator = custom && end <= now ? "lt" : "lte";
+  const select = `id,happened_at,tool_channel,app_version,${DIAGNOSTIC_CLASSIFICATION_SELECT}`;
+  let sample, total;
+  try {
+    ({ items: sample, total } = await supabasePage(env,
+      `/crash_logs?select=${select}&happened_at=gte.${encodeURIComponent(from)}&happened_at=${endOperator}.${encodeURIComponent(to)}&order=happened_at.desc,id.desc&limit=${TRIAGE_SCAN_LIMIT}`));
+    if (sample.length > Math.min(total, TRIAGE_SCAN_LIMIT) || (!sample.length && total)) throw new Error("invalid_coverage_sample");
+  } catch {
+    throw new Error("diagnostics_unavailable");
+  }
+  const versions = new Map();
+  const totals = { errors: 0, warnings: 0 };
+  for (const row of sample) {
+    const classification = classifyDiagnostic(triageRow(row));
+    if (classification !== "error" && classification !== "warning") continue;
+    const channel = String(row.tool_channel || "").trim().toLowerCase();
+    const tool_channel = [...CHANNELS, "android-beta"].includes(channel) ? channel : null;
+    const app_version = diagnosticCoverageVersion(row.app_version);
+    const key = JSON.stringify([tool_channel, app_version]);
+    const group = versions.get(key) || {
+      tool_channel, app_version, errors: 0, warnings: 0, latest_report_id: row.id, latest_report_at: row.happened_at,
+    };
+    const metric = classification === "error" ? "errors" : "warnings";
+    group[metric]++;
+    totals[metric]++;
+    versions.set(key, group);
+  }
   return {
     success: true,
-    items: items
-      .sort((a, b) => String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || ""))),
-    has_more: page.has_more,
-    next_cursor: page.next_cursor,
-    summarized_reports: page.items.length,
-    retention_days: DIAGNOSTIC_RETENTION_DAYS,
+    window: {
+      days, from, to, retention_limited: start < cutoff, scanned_reports: sample.length, total_records: total,
+      oldest_scanned_at: sample.at(-1)?.happened_at ?? null, limited: sample.length < total,
+    },
+    totals,
+    versions: [...versions.values()].sort((a, b) => b.errors - a.errors || b.warnings - a.warnings),
   };
+}
+
+export async function readDiagnosticTriage(url, env) {
+  const now = Date.now();
+  const requested = url.searchParams.get("as_of");
+  const asOf = requested || new Date(now).toISOString();
+  const timestamp = Date.parse(asOf);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== asOf || timestamp > now + 30000) {
+    throw new Error("invalid_diagnostic_window");
+  }
+  const filters = await buildDiagnosticFilters(url, env);
+  const rows = filters ? await readDiagnosticRows(env, "crash_logs", `select=${TRIAGE_SELECT}&order=happened_at.desc,id.desc&limit=${TRIAGE_SCAN_LIMIT + 1}&happened_at=lte.${encodeURIComponent(asOf)}&${diagnosticFilterQuery(filters)}`) : [];
+  const sample = rows.slice(0, TRIAGE_SCAN_LIMIT);
+  const errorRows = sample.map(triageRow).filter((row) => classifyDiagnostic(row) === "error");
+  const items = await summarizeDiagnosticGroups(await Promise.all(errorRows.map(async (row) => ({
+    ...row,
+    fingerprint: await crashFingerprint(row),
+    user_id: verifiedDiagnosticUid(row) || null,
+    occurrence_count: safeInt(row.occurrences, 1, 1000000000),
+    first_happened_at: row.first_seen || row.happened_at,
+    last_happened_at: row.last_seen || row.happened_at,
+  }))), env, true);
+  const attention = items.filter((group) => group.status === "open" || group.status === "investigating").length;
+  return {
+    success: true,
+    items: url.searchParams.get("summary") === "true" ? [] : items,
+    counts: { recent: items.length, attention },
+    window: { as_of: asOf, scan_limit: TRIAGE_SCAN_LIMIT, scanned_reports: sample.length, matched_error_reports: errorRows.length, has_older: rows.length > TRIAGE_SCAN_LIMIT },
+  };
+}
+
+function projectAuditSummary(row) {
+  return {
+    id: row.id,
+    timestamp: row.happened_at,
+    actor: row.admin_email || null,
+    action: row.action,
+    target_type: row.entity,
+    target_id: row.entity_id,
+    outcome: row.outcome || undefined,
+    request_id: row.request_id || null,
+    source_service: "admin_worker",
+  };
+}
+
+async function readAuditRows(env, params, detail = false) {
+  const select = "id,action,entity,entity_id,admin_email,happened_at,request_id:payload->>request_id,outcome:payload->>outcome"
+    + (detail ? ",actor_role:payload->>actor_role,reason_code:payload->>reason_code,reason_note:payload->>reason_note" : "");
+  params.set("select", select);
+  params.set("order", "happened_at.desc,id.desc");
+  try {
+    const rows = await supabaseRequest(env, "admin_activity", "GET", { query: params.toString() });
+    if (Array.isArray(rows)) return rows;
+  } catch {
+    throw new Error("audit_unavailable");
+  }
+  throw new Error("audit_unavailable");
+}
+
+function auditFilterValue(value) {
+  const text = String(value ?? "").trim();
+  if (text.length > 128 || /[\x00-\x1f\x7f*]/.test(text)) throw new Error("invalid_audit_filter");
+  return text;
+}
+
+function auditSearchPattern(value) {
+  const escaped = value.replace(/[\\%_]/g, "\\$&");
+  return JSON.stringify("%" + escaped + "%");
 }
 
 async function listAuditLog(url, env) {
   const limit = safeInt(url.searchParams.get("limit"), 100, 500);
   const page = safeInt(url.searchParams.get("page"), 1, 5000);
-  const offset = (page - 1) * limit;
-  const action = safeSearchTerm(url.searchParams.get("action"));
-  const actor = safeSearchTerm(url.searchParams.get("actor"));
-  const targetType = safeSearchTerm(url.searchParams.get("target_type"));
-  const from = String(url.searchParams.get("from") || "").trim();
-  const to = String(url.searchParams.get("to") || "").trim();
+  const rawCursor = url.searchParams.get("cursor");
+  if (rawCursor && rawCursor.length > 256) throw new Error("invalid_audit_cursor");
+  const cursor = parseTimestampedCursor(rawCursor, "invalid_audit_cursor");
+  const params = new URLSearchParams({ limit: String(limit + 1) });
+  if (!cursor && page > 1) params.set("offset", String((page - 1) * limit));
   const filters = [];
-  if (action) filters.push(`action=ilike.${encodeURIComponent(`*${action}*`)}`);
-  if (actor) filters.push(`admin_email=ilike.${encodeURIComponent(`*${actor}*`)}`);
-  if (targetType) filters.push(`entity=eq.${encodeURIComponent(targetType)}`);
-  if (Number.isFinite(Date.parse(from))) filters.push(`happened_at=gte.${encodeURIComponent(new Date(from).toISOString())}`);
-  if (Number.isFinite(Date.parse(to))) filters.push(`happened_at=lte.${encodeURIComponent(new Date(to).toISOString())}`);
-  const rows = await safeSupabaseRead(env, "admin_activity", `select=id,action,entity,entity_id,admin_email,payload,happened_at&order=happened_at.desc&limit=${limit}&offset=${offset}${filters.length ? `&${filters.join("&")}` : ""}`);
-  if (Array.isArray(rows) && rows.length) {
-    return {
-      success: true,
-      items: rows.map((row) => ({
-        id: row.id,
-        timestamp: row.happened_at,
-        actor: row.admin_email || null,
-        actor_role: row.payload?.actor_role || null,
-        action: row.action,
-        target_type: row.entity,
-        target_id: row.entity_id,
-        request_id: row.payload?.request_id || null,
-        reason_code: row.payload?.reason_code || null,
-        reason_note: row.payload?.reason_note || null,
-        outcome: row.payload?.outcome || "completed",
-        previous_summary: row.payload?.previous_summary || null,
-        resulting_summary: row.payload?.resulting_summary || null,
-        source_service: "admin_worker",
-      })),
-      page,
-      limit,
-      retention: "Supabase admin_activity is canonical; R2 is a compatibility fallback for legacy events.",
-    };
+  const search = auditFilterValue(url.searchParams.get("search"));
+  if (search) {
+    const term = auditSearchPattern(search);
+    filters.push("or(" + ["action", "admin_email", "entity", "entity_id", "payload->>request_id"].map((key) => key + ".ilike." + term).join(",") + ")");
   }
-  const audit = await loadAudit(env);
+  for (const [name, field] of [["action", "action"], ["actor", "admin_email"], ["target_type", "entity"]]) {
+    const term = auditFilterValue(url.searchParams.get(name));
+    if (term) filters.push(field + (name === "target_type" ? ".eq." + JSON.stringify(term) : ".ilike." + auditSearchPattern(term)));
+  }
+  for (const [name, op] of [["from", "gte"], ["to", "lte"]]) {
+    const value = url.searchParams.get(name);
+    if (!value) continue;
+    const millis = Date.parse(value);
+    if (!Number.isFinite(millis)) throw new Error("invalid_audit_filter");
+    params.append("happened_at", op + "." + new Date(millis).toISOString());
+  }
+  if (cursor) filters.push("or(happened_at.lt." + cursor.at + ",and(happened_at.eq." + cursor.at + ",id.lt." + cursor.id + "))");
+  if (filters.length) params.set("and", "(" + filters.join(",") + ")");
+  const rows = await readAuditRows(env, params, true);
+  const items = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
   return {
     success: true,
-    items: audit
-      .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")))
-      .slice(offset, offset + limit)
-      .map((row, index) => ({
-        id: row.id || `legacy-${page}-${index}`,
-        timestamp: row.at || null,
-        actor: row.actor || null,
-        action: row.type || "legacy_admin_event",
-        target_type: row.entity || null,
-        target_id: row.entity_id || null,
-        outcome: "completed",
-        source_service: "r2_legacy_audit",
-      })),
+    items: items.map((row) => ({
+      ...projectAuditSummary(row),
+      actor_role: row.actor_role || null,
+      reason_code: row.reason_code || null,
+      reason_note: row.reason_note || null,
+    })),
     page,
     limit,
-    retention: "Supabase admin_activity is canonical; R2 is a compatibility fallback for legacy events.",
+    has_more: hasMore,
+    next_cursor: hasMore ? timestampedCursor(items.at(-1)) : null,
   };
 }
 
@@ -4072,16 +4316,31 @@ async function listTamperAlerts(url, env) {
   const page = safeInt(url.searchParams.get("page"), 1, 5000);
   const resolved = String(url.searchParams.get("resolved") || "").trim();
   const severity = String(url.searchParams.get("severity") || "").trim().toLowerCase();
-  const filters = [];
-  if (["true", "false"].includes(resolved)) filters.push(`resolved=is.${resolved}`);
-  if (severity) filters.push(`severity=eq.${encodeURIComponent(severity)}`);
-  const offset = (page - 1) * limit;
-  const rows = await safeSupabaseRead(env, "tamper_alerts", `select=id,happened_at,user_id,subscription_id,hwid,severity,reason,details,resolved,resolved_at&order=happened_at.desc&limit=${limit}&offset=${offset}${filters.length ? `&${filters.join("&")}` : ""}`);
+  const userId = String(url.searchParams.get("user") || "").trim();
+  if (userId.length > 128 || /[\x00-\x20,()"\\]/.test(userId)) throw new Error("invalid_diagnostic_user");
+  const params = new URLSearchParams({
+    select: "id,happened_at,hwid,severity,reason,resolved,resolved_at" + (userId ? ",owner:account_subscriptions()" : ""),
+    order: "happened_at.desc,id.desc",
+    limit: String(limit + 1),
+    offset: String((page - 1) * limit),
+  });
+  if (userId) {
+    params.set("owner.firebase_user_id", "eq." + userId);
+    params.set("owner", "not.is.null");
+  }
+  if (["true", "false"].includes(resolved)) params.set("resolved", "is." + resolved);
+  if (severity) params.set("severity", "eq." + severity);
+  const rows = await readDiagnosticRows(env, "tamper_alerts", params.toString());
   return {
     success: true,
-    items: (Array.isArray(rows) ? rows : []).map((row) => ({ ...row, details: sanitizeCrashValue(row.details || {}) })),
+    items: await Promise.all(rows.slice(0, limit).map(async ({ id, happened_at, hwid, severity, reason, resolved, resolved_at }) => ({
+      id, happened_at, severity, resolved, resolved_at,
+      reason: sanitizeCrashString(reason || ""),
+      device_key: hwid ? (await sha256Hex(`saturnws-device:${hwid}`)).slice(0, 16) : null,
+    }))),
     page,
     limit,
+    has_more: rows.length > limit,
   };
 }
 
@@ -4101,30 +4360,63 @@ async function resolveTamperAlert(alertId, request, env, context) {
 }
 
 async function getAdminReadiness(env) {
-  const checks = await Promise.allSettled([
-    safeSupabaseRead(env, "account_profiles", "select=firebase_uid&limit=1"),
-    safeSupabaseRead(env, "admin_operation_requests", "select=id&limit=1"),
-    safeSupabaseRead(env, "admin_crash_group_state", "select=fingerprint&limit=1"),
+  const databaseChecks = await Promise.all([
+    probeReadinessTable(env, "account_profiles", "firebase_uid"),
+    probeReadinessTable(env, "admin_operation_requests", "id"),
+    probeReadinessTable(env, "admin_crash_group_state", "fingerprint"),
   ]);
+  const policyBinding = typeof env.POLICY_WORKER?.fetch === "function";
+  const bucketBinding = hasOtaBucket(env);
+  const roleAssignments = adminRoleAssignmentsState(env);
+  const layer1 = adminLayer1Configured(env);
+  const allowlist = parseAdminAllowlist(env).length > 0;
+  const paymentConfigured = Boolean(String(env.STRIPE_SECRET_KEY || env.NOWPAYMENTS_API_KEY || "").trim());
+  const emailEnabled = String(env.EMAIL_AUTH_ENABLED || "false").toLowerCase() === "true";
+  const configurationCheck = (id, group, configured) => ({ id, group, kind: "configuration", status: configured ? "configured" : "missing", reason: configured ? "configuration_present" : "not_configured" });
+  const checks = [
+    ...databaseChecks,
+    configurationCheck("policy_worker_binding", "configuration", policyBinding),
+    configurationCheck("ota_bucket_binding", "configuration", bucketBinding),
+    { id: "payment_provider", group: "configuration", kind: "configuration", status: "disabled", reason: paymentConfigured ? "configuration_present_disabled" : "integration_not_active" },
+    { id: "email_auth", group: "configuration", kind: "configuration", status: emailEnabled ? "configured" : "disabled", reason: emailEnabled ? "flag_enabled" : "flag_disabled" },
+    configurationCheck("layer1", "security", layer1),
+    { id: "role_assignments", group: "security", kind: "configuration", status: roleAssignments === "configured" ? "configured" : "review", reason: roleAssignments === "configured" ? "configuration_present" : "role_configuration_missing" },
+    configurationCheck("firebase_allowlist", "security", allowlist),
+  ];
+  const schemaChecks = databaseChecks.slice(1);
   return {
     success: true,
     generated_at: new Date().toISOString(),
+    checks,
     services: {
-      supabase: checks[0].status === "fulfilled" ? "ready" : "degraded",
-      admin_operations_schema: checks.slice(1).every((check) => check.status === "fulfilled") ? "ready" : "migration_pending",
-      policy_worker_binding: env.POLICY_WORKER ? "configured" : "missing",
-      ota_bucket_binding: hasOtaBucket(env) ? "configured" : "missing",
+      supabase: databaseChecks[0].status === "passed" ? "ready" : "unavailable",
+      admin_operations_schema: schemaChecks.every((check) => check.status === "passed") ? "ready" : schemaChecks.some((check) => check.reason === "read_unavailable" || check.reason === "not_configured") ? "unavailable" : "migration_pending",
+      policy_worker_binding: policyBinding ? "configured" : "missing",
+      ota_bucket_binding: bucketBinding ? "configured" : "missing",
     },
     integrations: {
-      payment_provider: String(env.STRIPE_SECRET_KEY || env.NOWPAYMENTS_API_KEY || "").trim() ? "configured" : "waiting_external_integration",
-      email_auth: String(env.EMAIL_AUTH_ENABLED || "false").toLowerCase() === "true" ? "enabled" : "disabled",
+      payment_provider: paymentConfigured ? "configured" : "waiting_external_integration",
+      email_auth: emailEnabled ? "enabled" : "disabled",
     },
     admin_security: {
-      layer1: adminLayer1Configured(env) ? "configured" : "not_configured",
-      role_assignments: adminRoleAssignmentsState(env),
-      firebase_allowlist: parseAdminAllowlist(env).length ? "configured" : "missing",
+      layer1: layer1 ? "configured" : "not_configured",
+      role_assignments: roleAssignments,
+      firebase_allowlist: allowlist ? "configured" : "missing",
     },
   };
+}
+
+async function probeReadinessTable(env, table, column) {
+  const base = { id: table, group: "database", kind: "read" };
+  try {
+    const rows = await supabaseRequest(env, table, "GET", { query: `select=${column}&limit=1`, signal: AbortSignal.timeout(5000) });
+    if (!Array.isArray(rows)) return { ...base, status: "unavailable", reason: "read_unavailable" };
+    return { ...base, status: "passed", reason: "read_succeeded" };
+  } catch (error) {
+    if (error?.message === "supabase_not_configured") return { ...base, status: "missing", reason: "not_configured" };
+    if (["42P01", "PGRST205"].includes(error?.code)) return { ...base, status: "missing", reason: "schema_missing" };
+    return { ...base, status: "unavailable", reason: "read_unavailable" };
+  }
 }
 
 const ACCOUNT_DEVICE_CHANGE_SELECT = [
@@ -4188,27 +4480,45 @@ async function listAccountDeviceChangeRequests(url, env) {
   const page = safeInt(url.searchParams.get("page"), 1, 5000);
   const limit = safeInt(url.searchParams.get("limit"), 25, 100);
   const offset = (page - 1) * limit;
-  const rows = await supabaseRequest(env, "account_device_change_requests", "GET", {
-    query: `select=${ACCOUNT_DEVICE_CHANGE_SELECT}${status === "all" ? "" : `&status=eq.${encodeURIComponent(status)}`}&order=requested_at.asc&limit=${limit}&offset=${offset}`,
-  });
-  const items = Array.isArray(rows) ? rows : [];
+  const order = status === "pending" ? "requested_at.asc,id.asc" : "requested_at.desc,id.desc";
+  const rows = await readDeviceChangeRows(env, `select=${ACCOUNT_DEVICE_CHANGE_SELECT}${status === "all" ? "" : `&status=eq.${status}`}&order=${order}&limit=${limit + 1}&offset=${offset}`);
+  const items = rows.slice(0, limit);
   const profiles = await accountProfilesByUid(env, items.map((item) => item.firebase_uid));
   return {
     success: true,
-    items: items.map((item) => ({ ...item, account: profiles.get(item.firebase_uid) || null })),
+    items: items.map((item) => ({ ...publicDeviceChangeRecord(item), account: profiles.get(item.firebase_uid) || null })),
     page,
     limit,
-    has_more: items.length === limit,
+    has_more: rows.length > limit,
   };
+}
+
+async function readDeviceChangeRows(env, query) {
+  try {
+    const rows = await supabaseRequest(env, "account_device_change_requests", "GET", { query });
+    if (!Array.isArray(rows) || rows.some((row) => !isUuid(row?.id) ||
+        !["pending", "approved", "rejected", "cancelled"].includes(row.status))) throw new Error("invalid_device_change_rows");
+    return rows;
+  } catch {
+    throw new Error("device_change_requests_unavailable");
+  }
+}
+
+async function getAccountDeviceChangeRequest(changeRequestId, env) {
+  const item = await readAccountDeviceChangeInternal(changeRequestId, env);
+  const profiles = await accountProfilesByUid(env, [item.firebase_uid]);
+  return { ...publicDeviceChangeRecord(item), account: profiles.get(item.firebase_uid) || null };
+}
+
+function publicDeviceChangeRecord(item) {
+  return Object.fromEntries(ACCOUNT_DEVICE_CHANGE_SELECT.split(",").map((key) => [key, item[key]]));
 }
 
 async function readAccountDeviceChangeInternal(changeRequestId, env) {
   if (!isUuid(changeRequestId)) throw new Error("device_change_request_not_found");
-  const rows = await supabaseRequest(env, "account_device_change_requests", "GET", {
-    query: `select=${ACCOUNT_DEVICE_CHANGE_SELECT},resolution_request_id&id=eq.${encodeURIComponent(changeRequestId)}&limit=1`,
-  });
-  const item = Array.isArray(rows) ? rows[0] : null;
+  const [item] = await readDeviceChangeRows(env, `select=${ACCOUNT_DEVICE_CHANGE_SELECT},resolution_request_id&id=eq.${encodeURIComponent(changeRequestId)}&limit=1`);
   if (!item) throw new Error("device_change_request_not_found");
+  if (typeof item.id !== "string" || item.id.toLowerCase() !== changeRequestId.toLowerCase()) throw new Error("device_change_requests_unavailable");
   return item;
 }
 
@@ -4226,7 +4536,7 @@ async function buildAccountDeviceChangePreview(changeRequestId, body, env, exist
     reason: input.reason,
   }));
   return {
-    request: Object.fromEntries(Object.entries(item).filter(([key]) => key !== "resolution_request_id")),
+    request: publicDeviceChangeRecord(item),
     account: profiles.get(item.firebase_uid) || null,
     action: input.action,
     reason: input.reason,
@@ -4245,7 +4555,7 @@ async function executeAccountDeviceChange(changeRequestId, request, env, context
   if (requestId.length < 8 || requestId.length > 200) throw new Error("invalid_request_id");
   const existing = await readAccountDeviceChangeInternal(changeRequestId, env);
   if (existing.status !== "pending" && existing.resolution_request_id === requestId) {
-    return { item: Object.fromEntries(Object.entries(existing).filter(([key]) => key !== "resolution_request_id")), idempotent: true };
+    return { item: publicDeviceChangeRecord(existing), idempotent: true };
   }
   const preview = await buildAccountDeviceChangePreview(changeRequestId, body, env, existing);
   if (!expectedPreviewHash || expectedPreviewHash !== preview.preview_hash) throw new Error("preview_changed");
@@ -4269,7 +4579,7 @@ async function executeAccountDeviceChange(changeRequestId, request, env, context
     payload: { firebase_uid: preview.request.firebase_uid, reason: preview.reason, request_id: requestId },
     at: new Date().toISOString(),
   });
-  return { item: Object.fromEntries(Object.entries(item).filter(([key]) => !["requested_hwid_hash", "resolution_request_id"].includes(key))), idempotent: false };
+  return { item: publicDeviceChangeRecord(item), idempotent: false };
 }
 
 async function buildAccountDeviceResetPreview(firebaseUid, body, env) {
@@ -4282,10 +4592,12 @@ async function buildAccountDeviceResetPreview(firebaseUid, body, env) {
   });
   const binding = Array.isArray(rows) ? rows[0] : null;
   if (!binding) throw new Error("device_not_found");
-  const sessions = await safeSupabaseRead(env, "app_sessions", `select=id&user_id=eq.${encodeURIComponent(uid)}&revoked_at=is.null&limit=200`);
+  const activeSessionCount = await countSupabaseRows(env, "app_sessions",
+    `select=id&user_id=eq.${encodeURIComponent(uid)}&revoked_at=is.null&expires_at=gt.${encodeURIComponent(new Date().toISOString())}`)
+    .catch(() => { throw new Error("device_reset_unavailable"); });
   return {
     binding,
-    active_session_count: Array.isArray(sessions) ? sessions.length : 0,
+    active_session_count: activeSessionCount,
     reason,
     preview_hash: await sha256Hex(stableStringify({ firebase_uid: uid, binding_id: binding.id, binding_updated_at: binding.updated_at, reason })),
   };
@@ -4300,32 +4612,31 @@ async function executeAccountDeviceReset(firebaseUid, request, env, context) {
   const requestId = String(body?.request_id || body?.idempotency_key || "").trim();
   if (requestId.length < 8 || requestId.length > 200) throw new Error("invalid_request_id");
   const expectedPreviewHash = String(body?.preview_hash || "").trim();
-  let preview;
-  try {
-    preview = await buildAccountDeviceResetPreview(firebaseUid, body, env);
-  } catch (error) {
-    if (String(error instanceof Error ? error.message : error) !== "device_not_found") throw error;
-    const events = await safeSupabaseRead(env, "account_device_events", `select=id,details&firebase_uid=eq.${encodeURIComponent(firebaseUid)}&event_type=eq.device_binding_reset&order=created_at.desc&limit=20`);
-    if ((Array.isArray(events) ? events : []).some((event) => event?.details?.request_id === requestId)) return { reset: true, idempotent: true };
-    throw error;
+  if (!/^[a-f0-9]{64}$/.test(expectedPreviewHash)) throw new Error("preview_changed");
+  const events = await supabaseRequest(env, "account_device_events", "GET", {
+    query: `select=id,binding_id,actor_id,details&firebase_uid=eq.${encodeURIComponent(firebaseUid)}&event_type=eq.device_binding_reset&details->>request_id=eq.${encodeURIComponent(requestId)}&limit=1`,
+  });
+  const completed = Array.isArray(events) ? events[0] : null;
+  if (completed) {
+    if (completed.details?.reason !== String(body?.reason || "").trim().slice(0, 1000)
+      || completed.details?.preview_hash !== expectedPreviewHash
+      || String(completed.actor_id || "").trim().toLowerCase() !== String(context.email || "").trim().toLowerCase()) {
+      throw new Error("device_reset_request_conflict");
+    }
+    return { reset: true, idempotent: true };
   }
+  const preview = await buildAccountDeviceResetPreview(firebaseUid, body, env);
   if (!expectedPreviewHash || expectedPreviewHash !== preview.preview_hash) throw new Error("preview_changed");
   const reset = await supabaseRequest(env, "rpc/reset_account_device", "POST", {
-    body: { p_firebase_uid: firebaseUid, p_actor: context.email, p_reason: preview.reason, p_request_id: requestId },
+    body: { p_firebase_uid: firebaseUid, p_actor: context.email, p_reason: preview.reason, p_request_id: requestId,
+      p_expected_binding_id: preview.binding.id, p_expected_binding_updated_at: preview.binding.updated_at,
+      p_preview_hash: preview.preview_hash },
   });
-  if (reset !== true) throw new Error("device_reset_failed");
-  await appendAudit(env, {
-    type: "account_device_binding_reset",
-    entity: "account_device_binding",
-    entity_id: preview.binding.id,
-    actor: context.email,
-    payload: { firebase_uid: firebaseUid, reason: preview.reason, request_id: requestId, active_session_count: preview.active_session_count },
-    at: new Date().toISOString(),
-  });
-  return { reset: true, idempotent: false };
+  if (reset?.reset !== true || typeof reset.idempotent !== "boolean") throw new Error("device_reset_failed");
+  return { reset: true, idempotent: reset.idempotent };
 }
 
-async function getUserDetail(userKey, env) {
+async function getUserDetail(userKey, env, context, accountOnly) {
   if (!userKey) throw new Error("missing_user");
   const key = safeSearchTerm(userKey);
   const emailKey = key.includes("@") ? normalizeEmail(key) : "";
@@ -4338,24 +4649,32 @@ async function getUserDetail(userKey, env) {
   const profile = profiles[0];
   const userId = String(profile.firebase_uid || "").trim();
   const userEmail = normalizeEmail(profile.normalized_email);
-  const subscriptionRows = await safeSupabaseRead(
-    env,
-    "account_subscriptions",
+  const ownedSubscriptions = accountOnly
+    ? await readSubscriptionDirectory(new URL("https://admin.saturnws.com/api/admin/subscriptions?" + new URLSearchParams({ owner_uid: userId, limit: "100" })), env)
+    : null;
+  const subscriptionRows = ownedSubscriptions?.resolutionRows || await safeSupabaseRead(
+    env, "account_subscriptions",
     `select=*&firebase_user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=100`,
   );
-  const resolution = resolveSubscriptionTruth(subscriptionRows, { firebaseUid: userId, email: userEmail });
-  const diagnosticFilter = subscriptionDiagnosticFilter(subscriptionRows);
-  const [sessions, crashes, loginRequests, tamperAlerts, recentAudit, recoveryEvidence, deviceBindings, deviceChangeRequests] = await Promise.all([
+  const resolution = resolveSubscriptionTruth(subscriptionRows, { firebaseUid: userId, email: userEmail }, ownedSubscriptions ? { now: ownedSubscriptions.at } : {});
+  // The published Pages client still reads these fields. The account view loads diagnostics separately.
+  const legacyDiagnostics = !accountOnly && hasPermission(context, "diagnostics:read")
+    ? Promise.all([
+      listCrashLogs(new URL("https://admin.saturnws.com/api/admin/crash-logs?" + new URLSearchParams({ user: userId, classification: "all", limit: "50" })), env).catch(() => null),
+      listTamperAlerts(new URL("https://admin.saturnws.com/api/admin/tamper-alerts?" + new URLSearchParams({ user: userId })), env).catch(() => null),
+    ])
+    : Promise.resolve([null, null]);
+  const [sessions, loginRequests, recentAudit, recoveryEvidence, deviceBindings, deviceChangeRequests, [legacyReports, legacyTamper]] = await Promise.all([
     safeSupabaseRead(env, "app_sessions", `select=id,user_id,user_email,subscription_id,hwid,expires_at,revoked_at,created_at,last_seen_at&user_id=eq.${encodeURIComponent(userId)}&order=last_seen_at.desc&limit=100`),
-    listCrashLogs(new URL(`https://admin.saturnws.com/api/admin/crash-logs?user=${encodeURIComponent(userId)}&classification=all&limit=50`), env),
     safeSupabaseRead(env, "device_login_sessions", `select=id,hwid,status,user_id,user_email,subscription_id,expires_at,authorized_at,consumed_at,created_at&user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=50`),
-    diagnosticFilter
-      ? safeSupabaseRead(env, "tamper_alerts", `select=id,happened_at,user_id,subscription_id,hwid,severity,reason,details,resolved,resolved_at&${diagnosticFilter}&order=happened_at.desc&limit=50`)
-      : Promise.resolve([]),
-    safeSupabaseRead(env, "admin_activity", `select=id,action,entity,entity_id,admin_email,payload,happened_at&order=happened_at.desc&limit=200`),
+    hasPermission(context, "audit:read") ? readAuditRows(env, new URLSearchParams({
+      limit: "50",
+      or: "(" + ["entity_id", "payload->>firebase_uid", "payload->>target_firebase_uid"].map((field) => field + ".eq." + JSON.stringify(userId)).join(",") + ")",
+    })).catch(() => null) : Promise.resolve(null),
     safeSupabaseRead(env, "subscription_recovery_ledger", `select=id,firebase_uid,subscription_id,evidence_type,evidence_reference,remaining_seconds,status,created_at,expires_at,consumed_at&firebase_uid=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=50`),
     safeSupabaseRead(env, "account_device_bindings", `select=${ACCOUNT_DEVICE_BINDING_SELECT}&firebase_uid=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=20`),
     safeSupabaseRead(env, "account_device_change_requests", `select=${ACCOUNT_DEVICE_CHANGE_SELECT}&firebase_uid=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=20`),
+    legacyDiagnostics,
   ]);
   const supportPayload = await proxyPolicyAdmin(
     new Request("https://admin.saturnws.com/api/admin/internal-support", { method: "GET" }),
@@ -4365,7 +4684,6 @@ async function getUserDetail(userKey, env) {
   const supportThreads = (Array.isArray(supportPayload?.threads) ? supportPayload.threads : []).filter((thread) =>
     String(thread?.user_id || "").trim() === userId || normalizeEmail(thread?.email) === userEmail,
   );
-  const safeCrashes = crashes.items;
   const safeSessions = await Promise.all((Array.isArray(sessions) ? sessions : []).map(async (row) => {
     const { hwid, ...safe } = row;
     return { ...safe, device_key: hwid ? (await sha256Hex(`saturnws-device:${hwid}`)).slice(0, 16) : null };
@@ -4374,9 +4692,6 @@ async function getUserDetail(userKey, env) {
     const { hwid, ...safe } = row;
     return { ...safe, device_key: hwid ? (await sha256Hex(`saturnws-device:${hwid}`)).slice(0, 16) : null };
   }));
-  const userAudit = (Array.isArray(recentAudit) ? recentAudit : []).filter((row) =>
-    row.entity_id === userId || row.payload?.firebase_uid === userId || row.payload?.target_firebase_uid === userId,
-  ).slice(0, 50);
   const deviceMap = new Map();
   for (const session of Array.isArray(sessions) ? sessions : []) {
     const hwid = session.hwid || "unknown";
@@ -4420,17 +4735,15 @@ async function getUserDetail(userKey, env) {
     subscription_integrity: resolution.diagnostics,
     subscription_history: resolution.history,
     sessions: safeSessions,
-    crashes: safeCrashes,
+    ...(!accountOnly ? { crashes: legacyReports?.items || [], last_crash: legacyReports?.items[0] || null, tamper_alerts: legacyTamper?.items || [] } : {}),
     login_requests: safeLoginRequests,
     devices: [...deviceMap.values()],
     device_binding: (Array.isArray(deviceBindings) ? deviceBindings : []).find((binding) => binding.status === "active") || null,
     device_binding_history: Array.isArray(deviceBindings) ? deviceBindings : [],
     device_change_requests: Array.isArray(deviceChangeRequests) ? deviceChangeRequests : [],
-    tamper_alerts: Array.isArray(tamperAlerts) ? tamperAlerts : [],
-    audit: userAudit,
+    audit: recentAudit?.map(projectAuditSummary) ?? null,
     recovery_evidence: Array.isArray(recoveryEvidence) ? recoveryEvidence : [],
     support_threads: supportThreads.slice(0, 50),
-    last_crash: safeCrashes.length ? safeCrashes[0] : null,
     request: latestLoginRequest
       ? {
           user_id: latestLoginRequest.user_id || userId || null,

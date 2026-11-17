@@ -1,5 +1,10 @@
 import nacl from "tweetnacl"
 import { WorkerEntrypoint } from "cloudflare:workers"
+import { handleAdminInvite } from "./invite_admin"
+import { handleAdminGlobalPolicy } from "./global_policy_admin"
+import { handleAdminPolicyRecords } from "./policy_admin_records"
+import { EMAIL_PAYLOAD_STATE_SQL, EmailActivityQueryError, emailJobRetryReason, readEmailActivity, readEmailJob } from "./email_activity"
+import { readBoundedRequestText } from "../../shared/requestBody.js"
 import {
   EMAIL_CATALOG,
   RESEND_KNOWN_EVENTS,
@@ -183,6 +188,7 @@ interface SupportMessageRow {
   idempotency_key?: string | null
   source?: string | null
   provider_message_id?: string | null
+  admin_unread?: 0 | 1
 }
 
 type CanonicalSupportStatus = "open" | "awaiting_support" | "awaiting_customer" | "closed" | "reopened" | "blocked"
@@ -459,252 +465,6 @@ function parseBooleanInput(value: unknown): boolean {
   return ["1", "true", "yes", "on", "enabled", "mandatory"].includes(text)
 }
 
-function adminHtml(): Response {
-  const html = `<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Saturn Workspace Admin</title>
-  <style>
-    :root{color-scheme:dark;--bg:#070b10;--surface:#111820;--panel:#151e28;--border:#263241;--text:#f4f7fb;--muted:#9ca8b7;--accent:#4298ff;--danger:#ff5d66}
-    *{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:var(--bg);color:var(--text)}
-    main{max-width:1180px;margin:0 auto;padding:28px;display:grid;gap:18px}
-    header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;border-bottom:1px solid var(--border);padding-bottom:18px}
-    h1{margin:0;font-size:24px}h2{margin:0 0 12px;font-size:16px}p{margin:6px 0;color:var(--muted)}
-    section{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:16px}
-    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.full{grid-column:1/-1}
-    label{display:grid;gap:6px;margin:10px 0;color:var(--muted);font-size:13px}
-    input,select,textarea{width:100%;background:#0b1118;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
-    textarea{min-height:72px;resize:vertical}button{border:0;border-radius:10px;background:var(--accent);color:#05101d;font-weight:700;padding:10px 14px;cursor:pointer}
-    button.secondary{background:#202b38;color:var(--text);border:1px solid var(--border)}
-    button.danger{background:var(--danger);color:#160406}
-    table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border-bottom:1px solid var(--border);padding:9px;text-align:right;font-size:13px}th{color:var(--muted)}
-    .row{display:flex;gap:10px;align-items:end}.status{font-size:13px;color:var(--muted);white-space:pre-wrap}.pill{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:3px 8px;color:var(--muted)}
-    .support-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}
-    .support-list{display:grid;gap:8px;margin-top:10px}
-    .support-item{display:grid;gap:5px;background:#0b1118;border:1px solid var(--border);border-radius:12px;padding:12px;text-align:right;color:var(--text);width:100%}
-    .support-item:hover{border-color:#3d4c5e}
-    .support-item strong{font-size:14px}.support-item span{color:var(--muted);font-size:12px}
-    .support-detail{display:grid;gap:10px;margin-top:12px;border-top:1px solid var(--border);padding-top:12px}
-    .support-message{max-width:78%;border:1px solid var(--border);border-radius:12px;padding:9px 11px;background:#0b1118;white-space:pre-wrap}
-    .support-message.admin{margin-inline-start:auto;background:#102236;border-color:#2c5b8c}
-    .support-message.user{margin-inline-end:auto}
-    @media(max-width:860px){.grid{grid-template-columns:1fr}header{display:block}.row{display:grid}}
-  </style>
-</head>
-<body>
-<main>
-  <header>
-    <div>
-      <h1>Saturn Workspace Admin</h1>
-      <p>إدارة سياسة الوصول والتحديثات من Cloudflare D1. التغييرات هنا تؤثر على Worker مباشرة.</p>
-    </div>
-    <div style="min-width:320px">
-      <label>Admin token<input id="token" type="password" placeholder="ضع admin token المحلي" /></label>
-      <button class="secondary" onclick="saveToken()">حفظ token محليًا</button>
-      <button onclick="loadState()">تحديث البيانات</button>
-    </div>
-  </header>
-
-  <div class="grid">
-    <section>
-      <h2>Global Policy</h2>
-      <label><input id="kill" type="checkbox" /> Global kill switch</label>
-      <label><input id="mandatory" type="checkbox" /> Mandatory update</label>
-      <label>Update mode<select id="updateMode"><option value="optional">optional</option><option value="mandatory">mandatory</option></select></label>
-      <label>Minimum supported version<input id="minVersion" placeholder="مثال: 1.0.0" /></label>
-      <label>Blocked actions<textarea id="globalBlocked" placeholder="JSON array أو comma separated"></textarea></label>
-      <button onclick="saveGlobal()">حفظ السياسة العامة</button>
-    </section>
-
-    <section>
-      <h2>Disabled Versions</h2>
-      <div class="row">
-        <label>Version<input id="disabledVersion" placeholder="1.0.0" /></label>
-        <label>Reason<input id="disabledReason" placeholder="سبب داخلي اختياري" /></label>
-        <button onclick="saveDisabled(true)">إضافة</button>
-      </div>
-      <div id="disabledList"></div>
-    </section>
-
-    <section>
-      <h2>Users</h2>
-      <label>Email<input id="userEmail" placeholder="user@example.com" /></label>
-      <label>Status<select id="userStatus"><option value="active">active</option><option value="disabled">disabled</option><option value="banned">banned</option></select></label>
-      <label>Plan<input id="userPlan" value="default" /></label>
-        <label>Subscription status<select id="subStatus"><option value="">no change</option><option value="active">active</option><option value="expired">expired</option></select></label>
-      <button onclick="saveUser()">حفظ المستخدم</button>
-      <div id="usersList"></div>
-    </section>
-
-    <section>
-      <h2>Plan Features / Blocked Actions</h2>
-      <label>Plan ID<input id="planId" value="default" /></label>
-      <label>Features JSON<textarea id="planFeatures">{}</textarea></label>
-      <label>Blocked actions<textarea id="planBlocked">[]</textarea></label>
-      <label>Limits JSON<textarea id="planLimits">{}</textarea></label>
-      <button onclick="savePlan()">حفظ الخطة</button>
-    </section>
-
-    <section class="full">
-      <h2>Releases</h2>
-      <p>الإصدارات الداخلية القديمة تظهر كمؤرشفة/داخلية ولا تظهر كبداية عامة.</p>
-      <div id="releasesList"></div>
-      <div class="row">
-        <label>Version<input id="releaseVersion" value="1.0.0" /></label>
-        <label>Visibility<select id="releaseVisibility"><option value="public">public</option><option value="internal">internal</option><option value="archived">archived</option><option value="hidden">hidden</option></select></label>
-        <label>Type<input id="releaseType" value="public_release" /></label>
-        <button onclick="saveRelease()">حفظ release</button>
-      </div>
-    </section>
-
-    <section class="full">
-      <div class="support-toolbar">
-        <div>
-          <h2>Support Messages</h2>
-          <p>Messages sent from inside Saturn Workspace. Admin replies appear in the user's notifications.</p>
-        </div>
-        <button class="secondary" onclick="loadSupport()">Refresh messages</button>
-      </div>
-      <div id="supportList" class="support-list"></div>
-      <div id="supportDetail" class="support-detail" hidden>
-        <div id="supportMessages"></div>
-        <label>Admin reply<textarea id="supportReply" placeholder="Write the reply that should appear inside the app"></textarea></label>
-        <div class="row">
-          <button onclick="sendSupportReply()">Send reply</button>
-          <button class="secondary" onclick="closeSupportDetail()">Close</button>
-        </div>
-      </div>
-    </section>
-  </div>
-  <section><h2>Log</h2><div id="status" class="status">جاهز.</div></section>
-</main>
-<script>
-const $ = (id) => document.getElementById(id);
-function token(){return $("token").value || localStorage.getItem("saturn_admin_token") || ""}
-function saveToken(){localStorage.setItem("saturn_admin_token", $("token").value); log("تم حفظ token في هذا المتصفح فقط.");}
-function log(v){$("status").textContent = typeof v === "string" ? v : JSON.stringify(v,null,2)}
-async function api(path, options={}){
-  const res = await fetch(path,{...options,headers:{"content-type":"application/json","authorization":"Bearer "+token(),...(options.headers||{})}})
-  const data = await res.json().catch(()=>({}))
-  if(!res.ok) throw new Error(data.error || "request_failed")
-  return data
-}
-function listTable(rows, cols){
-  if(!rows || !rows.length) return "<p>لا توجد بيانات.</p>"
-  return "<table><thead><tr>"+cols.map(c=>"<th>"+c+"</th>").join("")+"</tr></thead><tbody>"+rows.map(r=>"<tr>"+cols.map(c=>"<td>"+String(r[c]??"")+"</td>").join("")+"</tr>").join("")+"</tbody></table>"
-}
-let supportThreads = [];
-let activeSupportThreadId = "";
-function escapeHtml(value){
-  return String(value ?? "").replace(/[&<>"']/g, ch => {
-    if(ch === "&") return "&amp;";
-    if(ch === "<") return "&lt;";
-    if(ch === ">") return "&gt;";
-    if(ch === '"') return "&quot;";
-    if(ch === "'") return "&#39;";
-    return ch;
-  })
-}
-function renderSupportList(rows){
-  supportThreads = Array.isArray(rows) ? rows : [];
-  if(!supportThreads.length){
-    $("supportList").innerHTML = "<p>No support messages yet.</p>";
-    return;
-  }
-  $("supportList").innerHTML = supportThreads.map(row => {
-    const unread = Number(row.unread_count || 0) > 0 ? "<span class='pill'>new</span>" : "";
-    const meta = [row.email, row.device_id, row.app_version, row.updated_at].filter(Boolean).join(" · ");
-    return "<button class='support-item' onclick='openSupportThread("+JSON.stringify(row.id)+")'>" +
-      "<strong>"+escapeHtml(row.subject || "Untitled message")+" "+unread+"</strong>" +
-      "<span>"+escapeHtml(meta)+"</span>" +
-      "<span>"+escapeHtml(row.last_message_body || "")+"</span>" +
-      "</button>";
-  }).join("");
-}
-async function loadSupport(){
-  try{
-    const data = await api("/v1/admin/support");
-    renderSupportList(data.threads || []);
-    if(activeSupportThreadId) await openSupportThread(activeSupportThreadId);
-  }catch(e){log("Failed to load support messages: "+e.message)}
-}
-function closeSupportDetail(){
-  activeSupportThreadId = "";
-  $("supportDetail").hidden = true;
-  $("supportMessages").innerHTML = "";
-  $("supportReply").value = "";
-}
-async function openSupportThread(threadId){
-  activeSupportThreadId = String(threadId || "");
-  if(!activeSupportThreadId) return;
-  try{
-    const data = await api("/v1/admin/support/messages?thread_id="+encodeURIComponent(activeSupportThreadId));
-    const messages = Array.isArray(data.messages) ? data.messages : [];
-    $("supportMessages").innerHTML = messages.map(msg =>
-      "<div class='support-message "+escapeHtml(msg.sender === "admin" ? "admin" : "user")+"'>" +
-      "<span class='pill'>"+escapeHtml(msg.sender || "")+" · "+escapeHtml(msg.created_at || "")+"</span><br />" +
-      escapeHtml(msg.body || "") +
-      "</div>"
-    ).join("");
-    $("supportDetail").hidden = false;
-  }catch(e){log("Failed to open support thread: "+e.message)}
-}
-async function sendSupportReply(){
-  const body = $("supportReply").value.trim();
-  if(!activeSupportThreadId || !body){ log("Reply body is required."); return; }
-  try{
-    log(await api("/v1/admin/support/reply",{method:"POST",body:JSON.stringify({thread_id:activeSupportThreadId,body})}));
-    $("supportReply").value = "";
-    await loadSupport();
-  }catch(e){log("Failed to send reply: "+e.message)}
-}
-async function loadState(){
-  try{
-    const data = await api("/v1/admin/state")
-    const g = data.global_policy || {}
-    $("kill").checked = !!g.kill_switch_enabled
-    $("mandatory").checked = !!g.mandatory_update_enabled
-    $("updateMode").value = g.update_mode || "optional"
-    $("minVersion").value = g.minimum_supported_version || ""
-    $("globalBlocked").value = g.blocked_actions_json || "[]"
-    $("disabledList").innerHTML = listTable(data.disabled_versions,["version","reason","created_at"])
-    $("usersList").innerHTML = listTable(data.users,["email","status","plan_id","role"])
-    $("releasesList").innerHTML = listTable(data.releases,["version","channel","release_type","visibility","artifact_kind","updated_at"])
-    renderSupportList(data.support_threads || [])
-    log("تم تحميل البيانات.")
-  }catch(e){log("فشل تحميل البيانات: "+e.message)}
-}
-async function saveGlobal(){
-  const payload={kill_switch_enabled:$("kill").checked,mandatory_update_enabled:$("mandatory").checked,update_mode:$("updateMode").value,minimum_supported_version:$("minVersion").value,blocked_actions:$("globalBlocked").value}
-  log(await api("/v1/admin/global-policy",{method:"POST",body:JSON.stringify(payload)})); await loadState()
-}
-async function saveDisabled(enabled){
-  log(await api("/v1/admin/disabled-versions",{method:"POST",body:JSON.stringify({version:$("disabledVersion").value,reason:$("disabledReason").value,disabled:enabled})})); await loadState()
-}
-async function saveUser(){
-  log(await api("/v1/admin/users",{method:"POST",body:JSON.stringify({email:$("userEmail").value,status:$("userStatus").value,plan_id:$("userPlan").value,subscription_status:$("subStatus").value})})); await loadState()
-}
-async function savePlan(){
-  log(await api("/v1/admin/plan-features",{method:"POST",body:JSON.stringify({plan_id:$("planId").value,features:$("planFeatures").value,blocked_actions:$("planBlocked").value,limits:$("planLimits").value})})); await loadState()
-}
-async function saveRelease(){
-  log(await api("/v1/admin/releases",{method:"POST",body:JSON.stringify({version:$("releaseVersion").value,visibility:$("releaseVisibility").value,release_type:$("releaseType").value,channel:"beta",artifact_kind:"full_setup"})})); await loadState()
-}
-$("token").value = localStorage.getItem("saturn_admin_token") || "";
-if($("token").value) loadState();
-</script>
-</body>
-</html>`
-  return new Response(html, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  })
-}
 
 function versionParts(version: string): number[] {
   return normalizeLower(version)
@@ -1570,6 +1330,11 @@ async function materializeEmailJobForSend(
   job: EmailJobRow,
 ): Promise<{ subject: string; html: string; text: string }> {
   if (!job.sensitive_payload_ciphertext) {
+    if (job.sensitive_payload_expires_at || job.sensitive_payload_purged_at) {
+      await env.DB.prepare("UPDATE email_jobs SET status = 'failed', last_error = 'sensitive_payload_unavailable', updated_at = datetime('now') WHERE id = ?1")
+        .bind(job.id).run()
+      throw new Error("sensitive_payload_unavailable")
+    }
     return { subject: job.subject, html: job.html_body || "", text: job.text_body || "" }
   }
   const expiresAt = normalizeText(job.sensitive_payload_expires_at)
@@ -1652,7 +1417,7 @@ async function sendClaimedEmailJob(env: Env, job: EmailJobRow): Promise<boolean>
     return true
   } catch (error) {
     const message = clampText(error instanceof Error ? error.message : String(error || "send_failed"), 900)
-    if (message === "sensitive_payload_expired") {
+    if (message === "sensitive_payload_expired" || message === "sensitive_payload_unavailable") {
       return false
     }
     const attempts = Number(job.attempt_count || 0) + 1
@@ -2606,6 +2371,53 @@ async function handleResendWebhook(request: Request, env: Env): Promise<Response
   return json({ success: true, event_type: eventType })
 }
 
+function emailOperationsConfiguration(env: Env, schema: { ok: boolean; missing: string[] }) {
+  return {
+    outbound_enabled: emailOutboundEnabled(env),
+    inbound_enabled: emailInboundEnabled(env),
+    scheduler_enabled: emailSchedulerEnabled(env),
+    category_flags: {
+      support: envFlag(env.EMAIL_SUPPORT_ENABLED, true),
+      auth: envFlag(env.EMAIL_AUTH_ENABLED, false),
+      billing: envFlag(env.EMAIL_BILLING_ENABLED, false),
+      subscription: envFlag(env.EMAIL_SUBSCRIPTION_ENABLED, false),
+      release: envFlag(env.EMAIL_RELEASE_ENABLED, false),
+      security: envFlag(env.EMAIL_SECURITY_ENABLED, false),
+    },
+    has_resend_send_api_key: Boolean(normalizeText(env.RESEND_SEND_API_KEY)),
+    has_resend_receive_api_key: Boolean(normalizeText(env.RESEND_RECEIVE_API_KEY)),
+    has_resend_webhook_secret: Boolean(normalizeText(env.RESEND_WEBHOOK_SECRET)),
+    from: emailFromSupport(env),
+    sender_identities: {
+      general: configuredSenderForEvent(env, "admin.email_test").from,
+      support: configuredSenderForEvent(env, "support.admin_replied").from,
+      security: configuredSenderForEvent(env, "security.new_login").from,
+      billing: configuredSenderForEvent(env, "billing.payment_succeeded").from,
+      account: configuredSenderForEvent(env, "account.welcome").from,
+    },
+    reply_domain: emailReplyDomain(env),
+    webhook_path: "/api/webhooks/resend",
+    schema,
+  }
+}
+
+async function handleAdminEmailConfiguration(env: Env): Promise<Response> {
+  const schema = await emailSchemaDiagnostics(env).catch(() => ({ ok: false, missing: ["schema_check_unavailable"] }))
+  return json({ success: true, config: emailOperationsConfiguration(env, schema), catalog: emailCatalogList(), generated_at: new Date().toISOString() })
+}
+
+async function handleAdminEmailActivity(request: Request, env: Env, jobId?: string): Promise<Response> {
+  try {
+    const result = jobId === undefined
+      ? await readEmailActivity(new URL(request.url), env.DB)
+      : await readEmailJob(env.DB, decodeURIComponent(jobId))
+    return result ? json(result) : json({ success: false, error: "email_job_not_found" }, 404)
+  } catch (error) {
+    if (error instanceof EmailActivityQueryError || error instanceof URIError) return json({ success: false, error: "email_activity_query_invalid" }, 400)
+    return json({ success: false, error: "email_activity_unavailable" }, 503)
+  }
+}
+
 async function handleAdminEmailStatus(env: Env): Promise<Response> {
   const queued = await env.DB.prepare("SELECT status, COUNT(*) AS count FROM email_jobs GROUP BY status").all<{ status: string; count: number }>().catch(() => ({ results: [] as Array<{ status: string; count: number }> }))
   let jobResults: unknown[] = []
@@ -2663,33 +2475,7 @@ async function handleAdminEmailStatus(env: Env): Promise<Response> {
   const now = new Date().toISOString()
   return json({
     success: true,
-    config: {
-      outbound_enabled: emailOutboundEnabled(env),
-      inbound_enabled: emailInboundEnabled(env),
-      scheduler_enabled: emailSchedulerEnabled(env),
-      category_flags: {
-        support: envFlag(env.EMAIL_SUPPORT_ENABLED, true),
-        auth: envFlag(env.EMAIL_AUTH_ENABLED, false),
-        billing: envFlag(env.EMAIL_BILLING_ENABLED, false),
-        subscription: envFlag(env.EMAIL_SUBSCRIPTION_ENABLED, false),
-        release: envFlag(env.EMAIL_RELEASE_ENABLED, false),
-        security: envFlag(env.EMAIL_SECURITY_ENABLED, false),
-      },
-      has_resend_send_api_key: Boolean(normalizeText(env.RESEND_SEND_API_KEY)),
-      has_resend_receive_api_key: Boolean(normalizeText(env.RESEND_RECEIVE_API_KEY)),
-      has_resend_webhook_secret: Boolean(normalizeText(env.RESEND_WEBHOOK_SECRET)),
-      from: emailFromSupport(env),
-      sender_identities: {
-        general: configuredSenderForEvent(env, "admin.email_test").from,
-        support: configuredSenderForEvent(env, "support.admin_replied").from,
-        security: configuredSenderForEvent(env, "security.new_login").from,
-        billing: configuredSenderForEvent(env, "billing.payment_succeeded").from,
-        account: configuredSenderForEvent(env, "account.welcome").from,
-      },
-      reply_domain: emailReplyDomain(env),
-      webhook_path: "/api/webhooks/resend",
-      schema,
-    },
+    config: emailOperationsConfiguration(env, schema),
     generated_at: now,
     catalog,
     metrics: {
@@ -2712,28 +2498,27 @@ async function handleAdminEmailRetry(request: Request, env: Env): Promise<Respon
   const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
   const jobId = normalizeText(body.job_id || body.id)
   if (!jobId) return json({ success: false, error: "job_id_required" }, 400)
-  const job = await env.DB.prepare("SELECT id, status, recipient, linked_ticket_id FROM email_jobs WHERE id = ?1 LIMIT 1")
+  const job = await env.DB.prepare(`SELECT id, status, recipient, linked_ticket_id, email_type, catalog_event_type, last_error, updated_at, ${EMAIL_PAYLOAD_STATE_SQL} AS sensitive_payload_state FROM email_jobs WHERE id = ?1 LIMIT 1`)
     .bind(jobId)
-    .first<{ id: string; status: string; recipient: string; linked_ticket_id: string | null }>()
+    .first<{ id: string; status: string; recipient: string; linked_ticket_id: string | null; email_type: string; catalog_event_type: string | null; last_error: string | null; updated_at: string; sensitive_payload_state: string }>()
   if (!job) return json({ success: false, error: "email_job_not_found" }, 404)
-  if (!["failed", "bounced", "complained"].includes(normalizeLower(job.status))) {
-    return json({ success: false, error: "email_job_not_retryable" }, 409)
-  }
   const recipientFlag = await env.DB.prepare("SELECT status FROM email_recipient_flags WHERE email = ?1 LIMIT 1")
     .bind(normalizeEmailAddress(job.recipient))
     .first<{ status: string }>()
-  if (recipientFlag && ["bounced", "complained", "suppressed"].includes(normalizeLower(recipientFlag.status))) {
-    return json({ success: false, error: "recipient_suppressed" }, 409)
-  }
-  await env.DB.prepare(
-    "UPDATE email_jobs SET status = 'queued', attempt_count = 0, next_attempt_at = datetime('now'), provider_message_id = NULL, sent_at = NULL, delivered_at = NULL, last_error = NULL, updated_at = datetime('now') WHERE id = ?1"
-  ).bind(jobId).run()
+  const retryReason = emailJobRetryReason(job, recipientFlag?.status)
+  if (retryReason) return json({ success: false, error: retryReason }, 409)
+  const reset = await env.DB.prepare(
+    `UPDATE email_jobs SET status = 'queued', attempt_count = 0, next_attempt_at = datetime('now'), provider_message_id = NULL, sent_at = NULL, delivered_at = NULL, last_error = NULL, updated_at = datetime('now')
+     WHERE id = ?1 AND status = ?2 AND updated_at = ?3
+       AND NOT EXISTS (SELECT 1 FROM email_recipient_flags WHERE email = lower(email_jobs.recipient) AND status IN ('bounced', 'complained', 'suppressed'))`
+  ).bind(jobId, job.status, job.updated_at).run()
+  if (!dbChanges(reset)) return json({ success: false, error: "email_job_changed" }, 409)
   await updatePortalNotificationEmailStatus(env, jobId, "retrying")
   if (job.linked_ticket_id) {
     await auditSupportEvent(env, { threadId: job.linked_ticket_id, eventType: "email_retry_requested", actorRole: "admin", metadata: { email_job_id: jobId } })
   }
-  const processed = await processEmailOutbox(env, 1)
-  return json({ success: true, processed })
+  const processed = await processEmailJobImmediately(env, jobId)
+  return json({ success: true, job_id: jobId, processed: { processed: Number(processed.attempted), sent: Number(processed.sent), skipped: Number(processed.skipped) } })
 }
 
 async function handleAdminEmailTest(request: Request, env: Env): Promise<Response> {
@@ -2766,8 +2551,8 @@ async function handleAdminEmailTest(request: Request, env: Env): Promise<Respons
     },
   })
   if (!jobId) return json({ success: false, error: "email_event_disabled_or_suppressed" }, 409)
-  const processed = await processEmailOutbox(env, 1)
-  return json({ success: true, job_id: jobId, processed })
+  const processed = await processEmailJobImmediately(env, jobId)
+  return json({ success: true, job_id: jobId, processed: { processed: Number(processed.attempted), sent: Number(processed.sent), skipped: Number(processed.skipped) } })
 }
 
 async function handleAdminEmailPreview(request: Request, env: Env): Promise<Response> {
@@ -2794,94 +2579,8 @@ async function handleAdminEmailProcess(env: Env): Promise<Response> {
   return json({ success: true, processed: await runEmailCron(env) })
 }
 
-function generateInviteCode(): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-  const bytes = crypto.getRandomValues(new Uint8Array(20))
-  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("")
-}
-
 function adminActor(request: Request): string {
   return clampText(request.headers.get("X-Saturn-Admin-Actor") || "admin", 160)
-}
-
-async function auditInviteAdmin(env: Env, actor: string, action: string, inviteId: string, reason?: string): Promise<void> {
-  await env.DB.prepare("INSERT INTO policy_audit (id, email, requested_action, decision, reason, created_at) VALUES (?1, ?2, ?3, 'allow', ?4, datetime('now'))")
-    .bind(crypto.randomUUID(), actor || null, action, reason || inviteId)
-    .run()
-}
-
-async function handleAdminInvitesList(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url)
-  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)))
-  const offset = Math.max(0, Number(url.searchParams.get("offset") || 0))
-  const status = normalizeLower(url.searchParams.get("status"))
-  const statement = status
-    ? env.DB.prepare("SELECT id,status,expires_at,max_uses,used_count,note,scope_json,restrictions_json,created_by,created_at,updated_at,revoked_at,revoked_by,revoke_reason FROM invite_codes WHERE status=?1 ORDER BY datetime(updated_at) DESC LIMIT ?2 OFFSET ?3").bind(status, limit, offset)
-    : env.DB.prepare("SELECT id,status,expires_at,max_uses,used_count,note,scope_json,restrictions_json,created_by,created_at,updated_at,revoked_at,revoked_by,revoke_reason FROM invite_codes ORDER BY datetime(updated_at) DESC LIMIT ?1 OFFSET ?2").bind(limit, offset)
-  const rows = await statement.all<InviteCodeRow>()
-  return json({
-    success: true,
-    items: (rows.results || []).map((row) => ({ ...row, scope: parseJsonObject(row.scope_json), restrictions: parseJsonObject(row.restrictions_json), scope_json: undefined, restrictions_json: undefined })),
-    limit,
-    offset,
-  })
-}
-
-async function handleAdminInviteCreate(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
-  const actor = adminActor(request)
-  const requestId = clampText(body.request_id || request.headers.get("Idempotency-Key"), 160)
-  if (requestId.length < 8) return json({ success: false, error: "request_id_required" }, 400)
-  const previous = await env.DB.prepare("SELECT id,status,expires_at,max_uses,used_count,note,created_at,updated_at FROM invite_codes WHERE creation_request_id=?1 LIMIT 1").bind(requestId).first<InviteCodeRow>()
-  if (previous) return json({ success: true, item: previous, code: null, replay: true })
-  const maxUsesRaw = body.max_uses === null || body.max_uses === undefined || body.max_uses === "" ? null : Number(body.max_uses)
-  if (maxUsesRaw !== null && (!Number.isInteger(maxUsesRaw) || maxUsesRaw < 1 || maxUsesRaw > 100000)) return json({ success: false, error: "invalid_max_uses" }, 400)
-  const expiresText = normalizeText(body.expires_at)
-  if (expiresText && (!Number.isFinite(Date.parse(expiresText)) || Date.parse(expiresText) <= Date.now())) return json({ success: false, error: "invalid_expiry" }, 400)
-  const scopeInput = getObject(body.scope)
-  const restrictionsInput = getObject(body.restrictions)
-  const scope = {
-    channels: Array.isArray(scopeInput.channels) ? scopeInput.channels.map(normalizeLower).filter(Boolean).slice(0, 20) : [],
-    app_versions: Array.isArray(scopeInput.app_versions) ? scopeInput.app_versions.map((value) => clampText(value, 80)).filter(Boolean).slice(0, 50) : [],
-  }
-  const restrictions = {
-    user_ids: Array.isArray(restrictionsInput.user_ids) ? restrictionsInput.user_ids.map((value) => clampText(value, 160)).filter(Boolean).slice(0, 100) : [],
-    emails: Array.isArray(restrictionsInput.emails) ? restrictionsInput.emails.map(normalizeLower).filter(Boolean).slice(0, 100) : [],
-    device_ids: Array.isArray(restrictionsInput.device_ids) ? restrictionsInput.device_ids.map((value) => clampText(value, 160)).filter(Boolean).slice(0, 100) : [],
-    install_ids: Array.isArray(restrictionsInput.install_ids) ? restrictionsInput.install_ids.map((value) => clampText(value, 160)).filter(Boolean).slice(0, 100) : [],
-    one_per_user: restrictionsInput.one_per_user === true,
-    one_per_device: restrictionsInput.one_per_device === true,
-  }
-  const code = generateInviteCode()
-  const id = crypto.randomUUID()
-  await env.DB.prepare("INSERT INTO invite_codes (id,code_hash,status,expires_at,max_uses,used_count,note,scope_json,restrictions_json,creation_request_id,created_by,created_at,updated_at) VALUES (?1,?2,'active',?3,?4,0,?5,?6,?7,?8,?9,datetime('now'),datetime('now'))")
-    .bind(id, await sha256Hex(code), expiresText ? new Date(expiresText).toISOString() : null, maxUsesRaw, clampMultilineText(body.note, 1000) || null, toJsonText(scope, {}), toJsonText(restrictions, {}), requestId, actor)
-    .run()
-  await auditInviteAdmin(env, actor, "invite.create", id)
-  return json({ success: true, item: { id, status: "active", expires_at: expiresText ? new Date(expiresText).toISOString() : null, max_uses: maxUsesRaw, used_count: 0, note: clampMultilineText(body.note, 1000) || null, scope, restrictions }, code, shown_once: true })
-}
-
-async function handleAdminInviteRevoke(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
-  const inviteId = clampText(body.invite_id, 160)
-  const reason = clampMultilineText(body.reason, 1000)
-  if (!inviteId) return json({ success: false, error: "invite_id_required" }, 400)
-  if (reason.length < 3) return json({ success: false, error: "reason_required" }, 400)
-  const actor = adminActor(request)
-  const result = await env.DB.prepare("UPDATE invite_codes SET status='revoked',revoked_at=datetime('now'),revoked_by=?1,revoke_reason=?2,updated_at=datetime('now') WHERE id=?3 AND status IN ('active','enabled')")
-    .bind(actor, reason, inviteId).run()
-  if (!dbChanges(result)) return json({ success: false, error: "invite_not_active" }, 409)
-  await auditInviteAdmin(env, actor, "invite.revoke", inviteId, reason)
-  return json({ success: true, invite_id: inviteId, status: "revoked" })
-}
-
-async function handleAdminInviteUsage(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url)
-  const inviteId = clampText(url.searchParams.get("invite_id"), 160)
-  if (!inviteId) return json({ success: false, error: "invite_id_required" }, 400)
-  const rows = await env.DB.prepare("SELECT id,user_id,email,install_id,device_id,app_version,channel,result,created_at FROM invite_code_validations WHERE invite_code_id=?1 ORDER BY datetime(created_at) DESC LIMIT 200")
-    .bind(inviteId).all()
-  return json({ success: true, items: rows.results || [] })
 }
 
 
@@ -3438,9 +3137,11 @@ function publicAttachment(row: Record<string, unknown>, admin = false) {
 }
 
 async function loadMessageAttachments(env: Env, threadId: string, admin = false): Promise<Map<string, unknown[]>> {
-  const rows = await env.DB.prepare(
+  const read = env.DB.prepare(
     "SELECT id, message_id, original_filename, mime_type, size_bytes, status, created_at FROM support_attachments WHERE thread_id = ?1 AND status = 'complete' AND deleted_at IS NULL ORDER BY datetime(created_at) ASC"
-  ).bind(threadId).all<Record<string, unknown>>().catch(() => ({ results: [] as Record<string, unknown>[] }))
+  ).bind(threadId).all<Record<string, unknown>>()
+  const rows = admin ? await read : await read.catch(() => ({ results: [] as Record<string, unknown>[] }))
+  if (admin && (!('success' in rows) || !rows.success || !Array.isArray(rows.results))) throw new Error("support_inbox_unavailable")
   const byMessage = new Map<string, unknown[]>()
   for (const row of rows.results || []) {
     const messageId = normalizeText(row.message_id)
@@ -3630,23 +3331,92 @@ async function querySupportThreadsForUser(env: Env, scope: { userId: string; ema
   return (rows.results || []).map(normalizeSupportThread)
 }
 
-async function queryAdminSupportThreads(env: Env): Promise<SupportThreadRow[]> {
+type AdminSupportInboxQuery = {
+  scope: "all" | "waiting"
+  status: CanonicalSupportStatus | ""
+  priority: "low" | "normal" | "high" | "urgent" | ""
+  query: string
+  threadId: string
+  page: number
+  limit: number
+}
+
+function parseAdminSupportInboxQuery(params: URLSearchParams): AdminSupportInboxQuery | null {
+  const scope = params.get("scope") || "all"
+  const status = params.get("status") || ""
+  const priority = params.get("priority") || ""
+  const page = Number(params.get("page") || "1")
+  const limit = Number(params.get("limit") || "25")
+  const query = normalizeLower(params.get("query"))
+  const threadId = normalizeText(params.get("thread_id"))
+  if ((scope !== "all" && scope !== "waiting") ||
+      (status && !Object.values(SUPPORT_STATUS_ALIASES).some((value) => value === status)) ||
+      (priority !== "" && priority !== "low" && priority !== "normal" && priority !== "high" && priority !== "urgent") ||
+      !Number.isSafeInteger(page) || page < 1 || page > 5000 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 50 || query.length > 200 ||
+      (threadId && (!/^[a-zA-Z0-9_-]{1,128}$/.test(threadId) || scope !== "all" || status || priority || query || page !== 1))) return null
+  return { scope, status: status as AdminSupportInboxQuery["status"], priority, query, threadId, page, limit }
+}
+
+async function queryAdminSupportThreads(env: Env, inbox?: AdminSupportInboxQuery): Promise<SupportThreadRow[]> {
+  const blocked = `EXISTS(SELECT 1 FROM support_message_blocks b WHERE b.active = 1 AND ${supportBlockMatchSql("t", "b")} LIMIT 1)`
+  const latestMessage = "FROM support_messages m WHERE m.thread_id = t.id ORDER BY datetime(m.created_at) DESC, m.id DESC LIMIT 1"
+  const lastMessageBody = `(SELECT body ${latestMessage})`
+  const priority = "CASE WHEN t.priority IN ('urgent', 'high', 'low') THEN t.priority ELSE 'normal' END"
+  const canonicalStatus = `CASE WHEN ${blocked} THEN 'blocked' ELSE CASE lower(trim(t.status)) ${Object.entries(SUPPORT_STATUS_ALIASES)
+    .map(([raw, canonical]) => `WHEN '${raw}' THEN '${canonical}'`).join(" ")} ELSE 'open' END END`
+  const conditions: string[] = []
+  const bindings: (string | number)[] = []
+  if (inbox?.scope === "waiting") conditions.push(`${canonicalStatus} IN ('open', 'awaiting_support', 'reopened')`)
+  if (inbox?.status) { conditions.push(`${canonicalStatus} = ?`); bindings.push(inbox.status) }
+  if (inbox?.priority) { conditions.push(`${priority} = ?`); bindings.push(inbox.priority) }
+  if (inbox?.threadId) { conditions.push("t.id = ?"); bindings.push(inbox.threadId) }
+  if (inbox?.query) {
+    const reference = /^sat-(\d{4})-([a-z0-9]{6})$/.exec(inbox.query)
+    if (reference) {
+      const [, year, suffix] = reference
+      const alternatives = ["lower(t.id) = ?", "(substr(t.created_at, 1, 4) = ? AND lower(substr('000000' || replace(t.id, '-', ''), -6)) = ?)"]
+      bindings.push(inbox.query, year, suffix)
+      if (/^\d{6}$/.test(suffix)) {
+        alternatives.push(`t.id IN (
+          WITH RECURSIVE ticket_hash(id, position, hash) AS (
+            SELECT id, 1, 0 FROM support_threads
+            WHERE substr(created_at, 1, 4) <= ? AND substr(updated_at, 1, 4) >= ?
+            UNION ALL
+            SELECT id, position + 1, (hash * 31 + unicode(substr(id, position, 1))) & 4294967295
+            FROM ticket_hash WHERE position <= length(id)
+          )
+          SELECT id FROM ticket_hash WHERE position > length(id) AND hash % 1000000 = ?
+        )`)
+        bindings.push(year, year, Number(suffix))
+      }
+      conditions.push(`(${alternatives.join(" OR ")})`)
+    } else {
+      const fields = ["t.id", "t.subject", "t.email", "t.install_id", "t.device_id", lastMessageBody]
+      conditions.push(`(${fields.map((field) => `instr(lower(coalesce(${field}, '')), ?) > 0`).join(" OR ")})`)
+      bindings.push(...fields.map(() => inbox.query))
+    }
+  }
+  const ordering = inbox?.scope === "waiting"
+    ? "datetime(coalesce(t.last_customer_reply_at, t.created_at)) ASC"
+    : "CASE WHEN unread_count > 0 THEN 0 ELSE 1 END, datetime(t.updated_at) DESC"
+  bindings.push(inbox ? (inbox.threadId ? 1 : inbox.limit + 1) : 100, inbox ? (inbox.page - 1) * inbox.limit : 0)
   const rows = await env.DB.prepare(
     `SELECT t.*,
-      (SELECT body FROM support_messages m WHERE m.thread_id = t.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_body,
-      (SELECT sender FROM support_messages m WHERE m.thread_id = t.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_sender,
-      (SELECT created_at FROM support_messages m WHERE m.thread_id = t.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_at,
-      (SELECT COUNT(*) FROM support_messages m WHERE m.thread_id = t.id AND (m.sender_role IN ('customer', 'email_inbound') OR (m.sender_role IS NULL AND m.sender = 'user')) AND (t.admin_last_read_at IS NULL OR datetime(m.created_at) > datetime(t.admin_last_read_at))) AS unread_count,
-      EXISTS(SELECT 1 FROM support_message_blocks b WHERE b.active = 1 AND ${supportBlockMatchSql("t", "b")} LIMIT 1) AS support_blocked
+      ${lastMessageBody} AS last_message_body,
+      (SELECT sender ${latestMessage}) AS last_message_sender,
+      (SELECT created_at ${latestMessage}) AS last_message_at,
+      (SELECT COUNT(*) FROM support_messages m WHERE m.thread_id = t.id AND m.admin_read_at IS NULL AND (m.sender_role IN ('customer', 'email_inbound') OR (m.sender_role IS NULL AND m.sender = 'user'))) AS unread_count,
+      ${blocked} AS support_blocked
      FROM support_threads t
-     ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
-              CASE WHEN unread_count > 0 THEN 0 ELSE 1 END,
-              datetime(t.updated_at) DESC
-     LIMIT 100`
+     ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+     ORDER BY CASE ${priority} WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, ${ordering}, t.id ASC
+     LIMIT ? OFFSET ?`
   )
+    .bind(...bindings)
     .all<SupportThreadRow>()
-    .catch(() => ({ results: [] as SupportThreadRow[] }))
-  return (rows.results || []).map(normalizeSupportThread)
+  if (!rows.success || !Array.isArray(rows.results)) throw new Error("support_inbox_unavailable")
+  return rows.results.map(normalizeSupportThread)
 }
 
 async function handleSupportCreate(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
@@ -4283,7 +4053,7 @@ async function handleAdminState(env: Env): Promise<Response> {
   )
     .all<ReleaseCatalogRow>()
     .catch(() => ({ results: [] as ReleaseCatalogRow[] }))
-  const supportThreads = await queryAdminSupportThreads(env)
+  const supportThreads = await queryAdminSupportThreads(env).catch(() => [])
   return json({
     success: true,
     global_policy: global || null,
@@ -4295,41 +4065,7 @@ async function handleAdminState(env: Env): Promise<Response> {
   })
 }
 
-async function handleAdminGlobalPolicy(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
-  const updateMode = normalizeLower(body.update_mode || "optional")
-  const safeUpdateMode = ["optional", "mandatory"].includes(updateMode) ? updateMode : "optional"
-  await env.DB.prepare(
-    "UPDATE global_policy SET kill_switch_enabled = ?1, mandatory_update_enabled = ?2, minimum_supported_version = ?3, update_mode = ?4, blocked_actions_json = ?5, features_json = ?6, limits_json = ?7, updated_at = datetime('now') WHERE id = 'global'"
-  )
-    .bind(
-      parseBooleanInput(body.kill_switch_enabled) ? 1 : 0,
-      parseBooleanInput(body.mandatory_update_enabled) ? 1 : 0,
-      normalizeText(body.minimum_supported_version),
-      safeUpdateMode,
-      JSON.stringify(normalizeListInput(body.blocked_actions)),
-      toJsonText(body.features, {}),
-      toJsonText(body.limits, {})
-    )
-    .run()
-  return json({ success: true })
-}
 
-async function handleAdminDisabledVersions(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
-  const version = normalizeLower(body.version)
-  if (!version) return json({ success: false, error: "version_required" }, 400)
-  if (body.disabled === false || normalizeLower(body.action) === "remove") {
-    await env.DB.prepare("DELETE FROM disabled_versions WHERE lower(version) = ?1").bind(version).run()
-  } else {
-    await env.DB.prepare(
-      "INSERT INTO disabled_versions (version, reason, created_at) VALUES (?1, ?2, datetime('now')) ON CONFLICT(version) DO UPDATE SET reason = excluded.reason"
-    )
-      .bind(version, normalizeText(body.reason) || null)
-      .run()
-  }
-  return json({ success: true })
-}
 
 async function handleAdminUser(request: Request, env: Env): Promise<Response> {
   const body = (await request.json<Record<string, unknown>>().catch(() => ({}))) as Record<string, unknown>
@@ -4388,12 +4124,23 @@ async function handleAdminRelease(request: Request, env: Env): Promise<Response>
   return json({ success: true })
 }
 
-async function handleAdminSupportList(env: Env): Promise<Response> {
-  return json({ success: true, threads: await queryAdminSupportThreads(env) })
+async function handleAdminSupportList(url: URL, env: Env): Promise<Response> {
+  const view = url.searchParams.get("view")
+  const inbox = view === "inbox" ? parseAdminSupportInboxQuery(url.searchParams) : undefined
+  if ((view && view !== "inbox") || inbox === null) return json({ success: false, error: "invalid_support_inbox_query" }, 400)
+  try {
+    const threads = await queryAdminSupportThreads(env, inbox)
+    if (!inbox) return json({ success: true, threads })
+    if (inbox.threadId && !threads.length) return json({ success: false, error: "thread_not_found" }, 404)
+    return json({ success: true, threads: threads.slice(0, inbox.limit), page: inbox.page, limit: inbox.limit, has_more: threads.length > inbox.limit })
+  } catch {
+    return json({ success: false, error: "support_inbox_unavailable" }, 503)
+  }
 }
 
 async function handleAdminSupportMessages(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
+  const legacy = url.pathname === "/v1/admin/support/messages"
   const threadId = normalizeText(url.searchParams.get("thread_id"))
   if (!threadId) return json({ success: false, error: "thread_id_required" }, 400)
   const thread = await env.DB.prepare(
@@ -4405,17 +4152,79 @@ async function handleAdminSupportMessages(request: Request, env: Env): Promise<R
     .bind(threadId)
     .first<SupportThreadRow>()
   if (!thread) return json({ success: false, error: "thread_not_found" }, 404)
-  const messages = await env.DB.prepare("SELECT id, thread_id, sender, sender_role, delivery_mode, source, provider_message_id, body, created_at FROM support_messages WHERE thread_id = ?1 ORDER BY datetime(created_at) ASC")
-    .bind(threadId)
-    .all<SupportMessageRow>()
-    .catch(() => ({ results: [] as SupportMessageRow[] }))
-  const audit = await env.DB.prepare("SELECT id, event_type, actor_role, actor_id, message_id, metadata_json, created_at FROM support_audit_events WHERE thread_id = ?1 ORDER BY datetime(created_at) ASC LIMIT 200")
-    .bind(threadId)
-    .all<Record<string, unknown>>()
-    .catch(() => ({ results: [] as Record<string, unknown>[] }))
-  await env.DB.prepare("UPDATE support_threads SET admin_last_read_at = datetime('now') WHERE id = ?1").bind(threadId).run()
-  const attachments = await loadMessageAttachments(env, threadId, true)
-  return json({ success: true, thread: normalizeSupportThread(thread), messages: (messages.results || []).map((message) => ({ ...normalizeSupportMessage(message), attachments: attachments.get(message.id) || [] })), audit: audit.results || [] })
+  const [messages, audit, attachments] = await Promise.all([
+    env.DB.prepare(`SELECT id, thread_id, sender, sender_role, delivery_mode, source, provider_message_id, body, created_at,
+      CASE WHEN admin_read_at IS NULL AND (sender_role IN ('customer', 'email_inbound') OR (sender_role IS NULL AND sender = 'user')) THEN 1 ELSE 0 END AS admin_unread
+      FROM support_messages WHERE thread_id = ?1 ORDER BY datetime(created_at) ASC, id ASC`)
+      .bind(threadId).all<SupportMessageRow>(),
+    legacy ? queryAdminSupportAudit(env, threadId, null, 200, true).catch(() => null) : null,
+    loadMessageAttachments(env, threadId, true),
+  ])
+  if (!messages.success || !Array.isArray(messages.results)) throw new Error("support_inbox_unavailable")
+  const unreadIds = messages.results.filter((message) => message.admin_unread === 1).map((message) => message.id)
+  const payload = {
+    success: true, thread: normalizeSupportThread(thread),
+    messages: messages.results.map(({ admin_unread: _adminUnread, ...message }) => ({ ...normalizeSupportMessage(message), attachments: attachments.get(message.id) || [] })),
+  }
+  if (!legacy) return json({ ...payload, unread_message_ids: unreadIds })
+  try { await markAdminSupportMessagesRead(env, threadId, unreadIds) }
+  catch { console.warn(JSON.stringify({ event: "support_admin_read_marker_failed" })) }
+  return json({ ...payload, audit: audit?.slice(0, 200).reverse() ?? [], audit_unavailable: !audit })
+}
+
+async function markAdminSupportMessagesRead(env: Env, threadId: string, ids: string[]): Promise<void> {
+  if (!ids.length) return
+  const result = await env.DB.prepare(`UPDATE support_messages SET admin_read_at = datetime('now')
+    WHERE thread_id = ?1 AND admin_read_at IS NULL
+      AND (sender_role IN ('customer', 'email_inbound') OR (sender_role IS NULL AND sender = 'user'))
+      AND id IN (SELECT value FROM json_each(?2))`).bind(threadId, JSON.stringify(ids)).run()
+  if (!result.success) throw new Error("support_read_unavailable")
+}
+
+async function handleAdminSupportRead(request: Request, env: Env): Promise<Response> {
+  const code = "invalid_support_read"
+  const body: { thread_id?: unknown; message_ids?: unknown } | null = await readBoundedRequestText(request, 20_000, code, true)
+    .then((raw) => JSON.parse(raw)).catch(() => null)
+  const threadId = body?.thread_id
+  const ids = body?.message_ids
+  const validId = (value: unknown): value is string => typeof value === "string" && /^[\w-]{1,160}$/.test(value)
+  if (!validId(threadId) || !Array.isArray(ids) || !ids.length || ids.length > 100 || !ids.every(validId)) {
+    return json({ success: false, error: code }, 400)
+  }
+  if (!await env.DB.prepare("SELECT id FROM support_threads WHERE id = ?1").bind(threadId).first()) {
+    return json({ success: false, error: "thread_not_found" }, 404)
+  }
+  await markAdminSupportMessagesRead(env, threadId, ids)
+  return json({ success: true })
+}
+
+async function queryAdminSupportAudit(env: Env, threadId: string, before: { at: number; id: string } | null, size: number, legacy = false) {
+  const column = "COALESCE(julianday(created_at), 0)"
+  const statement = env.DB.prepare(`SELECT id, event_type, actor_role, created_at${legacy ? ", actor_id, message_id, metadata_json" : ""}
+    FROM support_audit_events WHERE thread_id = ?1 ${before ? `AND (${column}, id) < (?2, ?3)` : ""}
+    ORDER BY ${column} DESC, id DESC LIMIT ${before ? "?4" : "?2"}`)
+  const result = await (before ? statement.bind(threadId, before.at, before.id, size + 1) : statement.bind(threadId, size + 1))
+    .all<{ id: string; event_type: string; actor_role: string; created_at: string }>()
+  if (!result.success || !Array.isArray(result.results)) throw new Error("support_history_unavailable")
+  return result.results
+}
+
+async function handleAdminSupportHistory(url: URL, env: Env): Promise<Response> {
+  const threadId = url.searchParams.get("thread_id") ?? ""
+  const cursor = url.searchParams.get("cursor")
+  if (!/^[\w-]{1,160}$/.test(threadId) || (cursor !== null && !/^[\w-]{1,160}$/.test(cursor))) {
+    return json({ success: false, error: "invalid_support_history_query" }, 400)
+  }
+  const anchor = cursor === null
+    ? await env.DB.prepare("SELECT id FROM support_threads WHERE id = ?1").bind(threadId).first<{ id: string }>()
+    : await env.DB.prepare("SELECT id, COALESCE(julianday(created_at), 0) AS at FROM support_audit_events WHERE id = ?1 AND thread_id = ?2")
+      .bind(cursor, threadId).first<{ id: string; at: number }>()
+  if (!anchor) return cursor === null
+    ? json({ success: false, error: "thread_not_found" }, 404)
+    : json({ success: false, error: "invalid_support_history_cursor" }, 400)
+  const size = 25
+  const rows = await queryAdminSupportAudit(env, threadId, "at" in anchor ? { id: anchor.id, at: Number(anchor.at) } : null, size)
+  return json({ success: true, thread_id: threadId, events: rows.slice(0, size), next_cursor: rows.length > size ? rows[size - 1].id : null })
 }
 
 async function handleAdminSupportAttachment(env: Env, attachmentId: string): Promise<Response> {
@@ -4504,8 +4313,8 @@ async function handleAdminSupportReply(request: Request, env: Env, ctx?: Executi
     env.DB.prepare("INSERT INTO support_messages (id, thread_id, sender, sender_role, delivery_mode, idempotency_key, source, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'portal', ?7, datetime('now'))")
       .bind(messageId, threadId, internalNote ? "internal" : "admin", senderRole, deliveryMode, idempotencyKey, message),
     env.DB.prepare(internalNote
-      ? "UPDATE support_threads SET admin_last_read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1"
-      : "UPDATE support_threads SET status = 'awaiting_customer', last_support_reply_at = datetime('now'), admin_last_read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1")
+      ? "UPDATE support_threads SET updated_at = datetime('now') WHERE id = ?1"
+      : "UPDATE support_threads SET status = 'awaiting_customer', last_support_reply_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1")
       .bind(threadId),
     env.DB.prepare("INSERT INTO support_audit_events (id, thread_id, event_type, actor_role, message_id, metadata_json, created_at) VALUES (?1, ?2, ?3, 'admin', ?4, ?5, datetime('now'))")
       .bind(crypto.randomUUID(), threadId, internalNote ? "internal_note_added" : "support_reply", messageId, toJsonText({ delivery_mode: deliveryMode }, {})),
@@ -4615,28 +4424,37 @@ async function handleAdminRequest(request: Request, env: Env, ctx?: ExecutionCon
   if (authError) return authError
   const url = new URL(request.url)
   if (request.method === "GET" && url.pathname === "/v1/admin/state") return handleAdminState(env)
-  if (request.method === "POST" && url.pathname === "/v1/admin/global-policy") return handleAdminGlobalPolicy(request, env)
-  if (request.method === "POST" && url.pathname === "/v1/admin/disabled-versions") return handleAdminDisabledVersions(request, env)
+  if (["GET", "POST"].includes(request.method) && url.pathname === "/v1/admin/global-policy") return handleAdminGlobalPolicy(request, env, adminActor(request))
+  if (["GET", "POST"].includes(request.method) && url.pathname === "/v1/admin/disabled-versions") return handleAdminPolicyRecords(request, env, adminActor(request))
+  if (request.method === "GET" && url.pathname === "/v1/admin/plan-features") return handleAdminPolicyRecords(request, env, adminActor(request))
   if (request.method === "POST" && url.pathname === "/v1/admin/users") return handleAdminUser(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/plan-features") return handleAdminPlanFeatures(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/releases") return handleAdminRelease(request, env)
-  if (request.method === "GET" && url.pathname === "/v1/admin/support") return handleAdminSupportList(env)
-  if (request.method === "GET" && url.pathname === "/v1/admin/support/messages") return handleAdminSupportMessages(request, env)
+  if (request.method === "GET" && url.pathname === "/v1/admin/support") return handleAdminSupportList(url, env)
+  if (request.method === "GET" && ["/v1/admin/support/messages", "/v1/admin/support/conversation"].includes(url.pathname)) {
+    return handleAdminSupportMessages(request, env).catch(() => json({ success: false, error: "support_inbox_unavailable" }, 503))
+  }
+  if (request.method === "GET" && url.pathname === "/v1/admin/support/history") {
+    return handleAdminSupportHistory(url, env).catch(() => json({ success: false, error: "support_history_unavailable" }, 503))
+  }
+  if (request.method === "POST" && url.pathname === "/v1/admin/support/read") {
+    return handleAdminSupportRead(request, env).catch(() => json({ success: false, error: "support_read_unavailable" }, 503))
+  }
   const adminAttachmentMatch = url.pathname.match(/^\/v1\/admin\/support\/attachments\/([^/]+)$/)
   if (request.method === "GET" && adminAttachmentMatch) return handleAdminSupportAttachment(env, decodeURIComponent(adminAttachmentMatch[1]))
   if (request.method === "POST" && url.pathname === "/v1/admin/support/block") return handleAdminSupportBlock(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/support/reply") return handleAdminSupportReply(request, env, ctx)
   if (request.method === "POST" && url.pathname === "/v1/admin/support/priority") return handleAdminSupportPriority(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/support/status") return handleAdminSupportStatus(request, env, ctx)
-  if (request.method === "GET" && url.pathname === "/v1/admin/email/status") return handleAdminEmailStatus(env)
+  if (request.method === "GET" && url.pathname === "/v1/admin/email/status") return url.searchParams.get("view") === "configuration" ? handleAdminEmailConfiguration(env) : handleAdminEmailStatus(env)
+  if (request.method === "GET" && url.pathname === "/v1/admin/email/activity") return handleAdminEmailActivity(request, env)
+  const emailJobMatch = url.pathname.match(/^\/v1\/admin\/email\/jobs\/([^/]+)$/)
+  if (request.method === "GET" && emailJobMatch) return handleAdminEmailActivity(request, env, emailJobMatch[1])
   if ((request.method === "GET" || request.method === "POST") && url.pathname === "/v1/admin/email/preview") return handleAdminEmailPreview(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/email/retry") return handleAdminEmailRetry(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/email/test") return handleAdminEmailTest(request, env)
   if (request.method === "POST" && url.pathname === "/v1/admin/email/process") return handleAdminEmailProcess(env)
-  if (request.method === "GET" && url.pathname === "/v1/admin/invites") return handleAdminInvitesList(request, env)
-  if (request.method === "POST" && url.pathname === "/v1/admin/invites/create") return handleAdminInviteCreate(request, env)
-  if (request.method === "POST" && url.pathname === "/v1/admin/invites/revoke") return handleAdminInviteRevoke(request, env)
-  if (request.method === "GET" && url.pathname === "/v1/admin/invites/usage") return handleAdminInviteUsage(request, env)
+  if (url.pathname === "/v1/admin/invites" || url.pathname.startsWith("/v1/admin/invites/")) return handleAdminInvite(request, env, adminActor(request))
   return json({ success: false, error: "admin_not_found" }, 404)
 }
 

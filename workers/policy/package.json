@@ -8,7 +8,8 @@
     "test:entitlement": "node scripts/check-entitlement-policy.mjs",
     "test:support": "node scripts/check-support-notifications.mjs",
     "test:invites": "node scripts/check-invites.mjs",
-    "test:required": "npm run check && npm run test:entitlement && npm run test:support && npm run test:invites && node scripts/check-email-content.mjs && node scripts/check-admin-alerts.mjs",
+    "test:policies": "node scripts/check-admin-policies.mjs",
+    "test:required": "npm run check && npm run test:entitlement && npm run test:support && npm run test:invites && npm run test:policies && node scripts/check-email-content.mjs && node scripts/check-admin-alerts.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "migrate:local": "wrangler d1 migrations apply saturnws-policy --local",
@@ -16,6 +17,12 @@
   },
   "dependencies": {
     "tweetnacl": "^1.0.3"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5",
+      "undici": "7.30.1"
+    }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260722.1",

@@ -3,6 +3,10 @@ import { join } from 'node:path'
 
 const root = process.cwd()
 const productionPage = readFileSync(join(root, 'src/new-ui/pages/production/ProductionPages.tsx'), 'utf8')
+const adminPage = readFileSync(join(root, 'src/new-ui/pages/production/AdminProductionPages.tsx'), 'utf8')
+const supportMessage = readFileSync(join(root, 'src/new-ui/pages/production/ProductionSupportMessage.tsx'), 'utf8')
+const adminAccessGate = readFileSync(join(root, 'src/new-ui/pages/production/AdminAccessGate.tsx'), 'utf8')
+const emailWorkspace = readFileSync(join(root, 'src/new-ui/pages/production/AdminEmailWorkspace.tsx'), 'utf8')
 const workspaceShell = readFileSync(join(root, 'src/new-ui/layouts/WorkspaceShell.tsx'), 'utf8')
 const sharedChrome = readFileSync(join(root, 'src/new-ui/layouts/SharedChrome.tsx'), 'utf8')
 const portalCss = readFileSync(join(root, 'src/new-ui/foundation/portal.css'), 'utf8')
@@ -23,11 +27,12 @@ const checks = [
   },
   {
     name: 'support thread rendering uses semantic sender roles',
-    pass: productionPage.includes('SupportThreadMessage') && productionPage.includes('supportSenderRole') && productionPage.includes('supportMessageClass'),
+    pass: productionPage.includes("import { SupportThreadMessage } from './ProductionSupportMessage'") && productionPage.includes('<SupportThreadMessage') &&
+      supportMessage.includes('const role = supportSenderRole(') && supportMessage.includes('supportMessageClass(role)'),
   },
   {
     name: 'page skeletons are page-specific rather than generic card placeholders',
-    pass: productionPage.includes('PortalOverviewSkeleton') && productionPage.includes('PortalSupportSkeleton') && productionPage.includes('AdminEmailOperationsSkeleton') && !productionPage.includes('PageSkeleton cards'),
+    pass: productionPage.includes('PortalOverviewSkeleton') && productionPage.includes('PortalSupportSkeleton') && emailWorkspace.includes('function EmailActivitySkeleton(') && emailWorkspace.includes('<AdminDataTable loading columns=') && !productionPage.includes('PageSkeleton cards'),
   },
   {
     name: 'page skeletons avoid filler subtitles unless the final page has one',
@@ -63,7 +68,7 @@ const checks = [
   },
   {
     name: 'normal loading states do not show retry actions',
-    pass: productionPage.includes("title={t('loading')} body={copyByLocale(locale, 'Checking admin access.'") && !productionPage.includes("title={t('loading')} body={t('adminConsole')} primaryLabel={t('retry')}"),
+    pass: adminPage.includes('<AdminAccessGate>') && adminAccessGate.includes("role={access.status === 'checking' ? 'status' : undefined}") && adminAccessGate.includes("{access.status === 'unavailable' || (denied && !originDenied) ? <Button") && ![productionPage, adminPage].some((source) => source.includes("title={t('loading')} body={t('adminConsole')} primaryLabel={t('retry')}")),
   },
   {
     name: 'production adapter avoids forced token refresh for account/support reads',

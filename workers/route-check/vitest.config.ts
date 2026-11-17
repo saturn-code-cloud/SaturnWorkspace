@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers"
+import { cloudflareTest } from "@cloudflare/vitest-plugin"
 import { defineConfig } from "vitest/config"
 
 export default defineConfig({
@@ -6,8 +6,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        // Keep tests on the newest workerd date bundled with this pinned pool;
-        // the production date remains declared in wrangler.jsonc.
+        // Use an explicit test date; production keeps its date in wrangler.jsonc.
         compatibilityDate: "2026-07-02",
         serviceBindings: {
           POLICY_CAPABILITIES: { name: "policy-capability-test", entrypoint: "RouteCapabilityService" },

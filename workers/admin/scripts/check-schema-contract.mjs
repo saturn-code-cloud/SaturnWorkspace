@@ -27,7 +27,7 @@ const sourceFiles = [
 const queryLiterals = []
 for (const relativePath of sourceFiles) {
   const content = readFileSync(resolve(repoRoot, relativePath), 'utf8')
-  const safeRead = /safeSupabaseRead\(\s*env\s*,\s*['"]account_profiles['"]\s*,\s*(?:'([^']*)'|"([^"]*)"|`([^`]*)`)/g
+  const safeRead = /(?:safeSupabaseRead|readDiagnosticRows|countSupabaseRows)\(\s*env\s*,\s*['"]account_profiles['"]\s*,\s*(?:'([^']*)'|"([^"]*)"|`([^`]*)`)/g
   for (const match of content.matchAll(safeRead)) queryLiterals.push({ file: relativePath, query: match[1] ?? match[2] ?? match[3] })
   const restPath = /(?:'\/account_profiles\?([^']*)'|"\/account_profiles\?([^"]*)"|`\/account_profiles\?([^`]*)`)/g
   for (const match of content.matchAll(restPath)) queryLiterals.push({ file: relativePath, query: match[1] ?? match[2] ?? match[3] })

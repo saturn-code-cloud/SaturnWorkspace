@@ -81,6 +81,7 @@ jobs:
         run: |
           npm run check
           npm run test:device-linking
+          npm run test:database
 
       - name: Install locked policy Worker dependencies
         working-directory: workers/policy
